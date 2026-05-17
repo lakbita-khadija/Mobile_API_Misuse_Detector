@@ -26,7 +26,7 @@ if FEATHERLESS_API_KEY:
         featherless_client = OpenAI(
             base_url="https://api.featherless.ai/v1",
             api_key=FEATHERLESS_API_KEY,
-            timeout=5.0
+            timeout=10.0
         )
         print("[LLM] Featherless client initialized")
     except Exception as e:
@@ -44,29 +44,44 @@ FEATHERLESS_MODEL = "openguardrails/OpenGuardrails-Text-4B-0124"
 GROQ_MODEL = "llama-3.3-70b-versatile"
 
 async def get_llm_recommendation(ip: str, score: int, risk_level: str, attack_type: str) -> tuple:
-    """Essaie Featherless d'abord, puis Groq, retourne (recommandation, provider)"""
+    """
+    Génère une recommandation de sécurité détaillée et actionable.
+    Essaie Featherless d'abord, puis Groq.
+    Retourne: (recommandation, provider_utilisé)
+    """
     
-    prompt = f"""Analyze this security event and provide a brief, actionable recommendation (max 3 sentences):
-- IP: {ip}
-- Risk Score: {score}/100 ({risk_level})
+    # Prompt professionnel pour une recommandation longue et structurée
+    prompt = f"""You are a senior cybersecurity expert. Analyze this security event and provide a DETAILED, ACTIONABLE recommendation.
+
+SECURITY EVENT:
+- IP Address: {ip}
+- Risk Score: {score}/100 ({risk_level.upper()})
 - Attack Type: {attack_type}
 
-Give practical advice for the security team. Be concise and professional."""
-    
+Provide a complete response with these THREE sections:
+
+1. [IMMEDIATE ACTION] - What should be done right now? (blocking, rate limiting, etc.)
+
+2. [INVESTIGATION] - What logs or patterns should the security team analyze?
+
+3. [STRATEGIC MITIGATION] - What long-term security improvements are recommended?
+
+Be specific, professional, and practical. Write in complete sentences."""
+
     # 1. Essayer Featherless (spécialisé sécurité)
     if featherless_client:
         try:
             response = featherless_client.chat.completions.create(
                 model=FEATHERLESS_MODEL,
                 messages=[
-                    {"role": "system", "content": "You are a cybersecurity expert. Give concise, actionable advice."},
+                    {"role": "system", "content": "You are a senior cybersecurity expert. Provide detailed, actionable security recommendations."},
                     {"role": "user", "content": prompt}
                 ],
-                temperature=0.3,
-                max_tokens=150
+                temperature=0.4,
+                max_tokens=500  # Longue recommandation
             )
             recommendation = response.choices[0].message.content.strip()
-            print(f"[LLM] Featherless generated recommendation for {ip}")
+            print(f"[LLM] Featherless generated detailed recommendation for {ip} ({len(recommendation)} chars)")
             return recommendation, "Featherless (OpenGuardrails)"
         except Exception as e:
             print(f"[LLM] Featherless failed: {e}")
@@ -76,18 +91,21 @@ Give practical advice for the security team. Be concise and professional."""
         try:
             response = groq_client.chat.completions.create(
                 model=GROQ_MODEL,
-                messages=[{"role": "user", "content": prompt}],
-                temperature=0.3,
-                max_tokens=150
+                messages=[
+                    {"role": "system", "content": "You are a senior cybersecurity expert. Provide detailed, actionable security recommendations."},
+                    {"role": "user", "content": prompt}
+                ],
+                temperature=0.4,
+                max_tokens=500
             )
             recommendation = response.choices[0].message.content.strip()
-            print(f"[LLM] Groq generated recommendation for {ip}")
+            print(f"[LLM] Groq generated detailed recommendation for {ip} ({len(recommendation)} chars)")
             return recommendation, "Groq (Llama 3.3 70B)"
         except Exception as e:
             print(f"[LLM] Groq failed: {e}")
     
     # 3. Pas de LLM disponible
-    return "No LLM available - check API keys", "none"
+    return "No LLM available - check API keys. Immediate action: Block IP and investigate logs.", "none"
 
 # Charger les scores IA au démarrage
 try:
@@ -135,6 +153,7 @@ def health():
 
 @app.post("/api/v1/analyze")
 async def analyze(entry: LogEntry):
+    # Règles de détection
     score = 20
 
     if entry.status in [401, 403]:
@@ -156,12 +175,14 @@ async def analyze(entry: LogEntry):
 
     score = min(score, 100)
 
+    # Score IA
     ai_score = ai_scores.get(entry.ip, 0)
     ai_level = ai_levels.get(entry.ip, "unknown")
     iso_score = ai_iso.get(entry.ip, 0)
     dbscan_score = ai_dbscan.get(entry.ip, 0)
     ae_score = ai_ae.get(entry.ip, 0)
 
+    # Score final combiné
     if ai_score > 0:
         final_score = int((score * 0.6) + (ai_score * 100 * 0.4))
         final_score = min(final_score, 100)
@@ -171,6 +192,7 @@ async def analyze(entry: LogEntry):
     action = get_action(final_score)
     risk_level = get_risk_level(final_score)
 
+    # Rate limiting
     if final_score >= 60:
         limit = 20 if final_score < 90 else 5
         allowed, remaining = token_bucket_check(entry.ip, limit, 60, r)
@@ -180,6 +202,7 @@ async def analyze(entry: LogEntry):
 
     r.set(f"score:{entry.ip}", final_score)
 
+    # Déterminer le type d'attaque
     if entry.failed_attempts >= 3 or (entry.status == 401 and "python-requests" in entry.user_agent.lower()):
         attack_type = "bruteforce"
     elif any(e in entry.endpoint for e in suspicious_endpoints):
@@ -191,15 +214,15 @@ async def analyze(entry: LogEntry):
     else:
         attack_type = "none"
 
-    # Générer recommandation LLM (score >= 75)
+    # Générer recommandation LLM DÉTAILLÉE pour scores élevés
     llm_recommendation = ""
     llm_provider = ""
-    if final_score >= 75:
+    if final_score >= 75:  # Seuil pour LLM (High, Critical, Attack)
         llm_recommendation, llm_provider = await get_llm_recommendation(
             entry.ip, final_score, risk_level, attack_type
         )
 
-    # Alerte Slack
+    # Alerte Slack pour scores critiques
     if final_score >= 90:
         r.lpush("alerts", f"{entry.ip}|{final_score}|{entry.endpoint}")
 
@@ -207,11 +230,12 @@ async def analyze(entry: LogEntry):
         if not r.exists(alert_key) and SLACK_WEBHOOK:
             r.setex(alert_key, 900, 1)
 
+            # Construction du message Slack avec recommandation LLM
             slack_msg = {
                 "blocks": [
                     {
                         "type": "header",
-                        "text": {"type": "plain_text", "text": "SECURITY ALERT — Mobile API Misuse Detector"}
+                        "text": {"type": "plain_text", "text": "🚨 SECURITY ALERT — Mobile API Misuse Detector"}
                     },
                     {"type": "divider"},
                     {
@@ -239,33 +263,33 @@ async def analyze(entry: LogEntry):
                         "type": "section",
                         "fields": [
                             {"type": "mrkdwn", "text": f"*Device:*\n`{entry.device_model}`"},
-                            {"type": "mrkdwn", "text": f"*User Agent:*\n`{entry.user_agent[:40]}`"}
+                            {"type": "mrkdwn", "text": f"*User Agent:*\n`{entry.user_agent[:50]}`"}
                         ]
                     },
                     {"type": "divider"},
                     {
                         "type": "section",
-                        "text": {"type": "mrkdwn", "text": f"*Action:* `block_and_alert` — IP blocked for 15 minutes"}
+                        "text": {"type": "mrkdwn", "text": f"*Action:* `{action}` — IP blocked for 15 minutes"}
                     }
                 ]
             }
             
-            # Ajouter recommandation LLM si disponible
-            if llm_recommendation and llm_recommendation != "No LLM available - check API keys":
+            # Ajouter la recommandation LLM détaillée
+            if llm_recommendation and "No LLM available" not in llm_recommendation:
                 slack_msg["blocks"].append({"type": "divider"})
                 slack_msg["blocks"].append({
                     "type": "section",
-                    "text": {"type": "mrkdwn", "text": f"*🤖 LLM Recommendation ({llm_provider}):*\n{llm_recommendation}"}
+                    "text": {"type": "mrkdwn", "text": f"*🤖 LLM RECOMMENDATION ({llm_provider})*\n{llm_recommendation}"}
                 })
             
             slack_msg["blocks"].append({
                 "type": "context",
-                "elements": [{"type": "mrkdwn", "text": f"Detected at {datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S')} UTC"}]
+                "elements": [{"type": "mrkdwn", "text": f"Detected at {datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S')} UTC | Multi-LLM Security Engine"}]
             })
             
             try:
                 async with httpx.AsyncClient() as client:
-                    await client.post(SLACK_WEBHOOK, json=slack_msg, timeout=3)
+                    await client.post(SLACK_WEBHOOK, json=slack_msg, timeout=5)
                     print(f"[SLACK] Alert sent for {entry.ip}")
             except Exception as e:
                 print(f"[SLACK WARNING] {e}")
@@ -295,7 +319,7 @@ async def analyze(entry: LogEntry):
         "is_mobile": entry.is_mobile,
         "platform": entry.platform,
         "blocked": final_score >= 90,
-        "llm_recommendation": llm_recommendation,
+        "llm_recommendation": llm_recommendation[:1000],  # Tronqué pour Elasticsearch
         "llm_provider": llm_provider
     }
 
@@ -304,7 +328,7 @@ async def analyze(entry: LogEntry):
             await client.post(
                 f"{ES_URL}/mobile-api-logs-{datetime.utcnow().strftime('%Y.%m.%d')}/_doc",
                 json=log_doc,
-                timeout=3
+                timeout=5
             )
     except Exception as e:
         print(f"[ES WARNING] Could not index: {e}")
@@ -312,6 +336,9 @@ async def analyze(entry: LogEntry):
     return {
         "ip": entry.ip,
         "score": final_score,
+        "rule_score": score,
+        "ai_score": ai_score,
+        "ai_level": ai_level,
         "risk_level": risk_level,
         "action": action,
         "attack_type": attack_type,
@@ -344,33 +371,35 @@ async def top_threats(limit: int = 10):
 
 @app.get("/api/v1/test-llm")
 async def test_llm():
-    """Test endpoint pour comparer les deux LLM"""
+    """Test endpoint pour comparer les deux LLM avec recommandations détaillées"""
     test_ip = "93.110.220.181"
-    results = {"status": "testing", "featherless": None, "groq": None}
+    results = {"status": "testing", "featherless": None, "groq": None, "note": "Detailed recommendations (max 500 chars)"}
+    
+    prompt = "What security actions for IP {test_ip} with score 94 (bruteforce)? Provide detailed recommendation in 3 sentences."
     
     if featherless_client:
         try:
             response = featherless_client.chat.completions.create(
                 model=FEATHERLESS_MODEL,
-                messages=[{"role": "user", "content": f"What action for IP {test_ip} with score 94? Answer in 10 words."}],
-                max_tokens=30,
+                messages=[{"role": "user", "content": prompt}],
+                max_tokens=200,
                 temperature=0.3
             )
             results["featherless"] = response.choices[0].message.content.strip()
         except Exception as e:
-            results["featherless"] = f"Error: {str(e)[:50]}"
+            results["featherless"] = f"Error: {str(e)[:80]}"
     
     if groq_client:
         try:
             response = groq_client.chat.completions.create(
                 model=GROQ_MODEL,
-                messages=[{"role": "user", "content": f"What action for IP {test_ip} with score 94? Answer in 10 words."}],
-                max_tokens=30,
+                messages=[{"role": "user", "content": prompt}],
+                max_tokens=200,
                 temperature=0.3
             )
             results["groq"] = response.choices[0].message.content.strip()
         except Exception as e:
-            results["groq"] = f"Error: {str(e)[:50]}"
+            results["groq"] = f"Error: {str(e)[:80]}"
     
     return results
 
