@@ -6,22 +6,88 @@ import os
 import pandas as pd
 from datetime import datetime
 from app.response.ratelimit import token_bucket_check
+from openai import OpenAI
 from groq import Groq
 
 ES_URL = "http://elasticsearch:9200"
 SLACK_WEBHOOK = os.getenv("SLACK_WEBHOOK", "")
+FEATHERLESS_API_KEY = os.getenv("FEATHERLESS_API_KEY", "")
 GROQ_API_KEY = os.getenv("GROQ_API_KEY", "")
 
 app = FastAPI(title="Mobile API Misuse Detector")
 r = redis.Redis(host='redis', port=6379, decode_responses=True)
 
-# Initialiser Groq si clé disponible
+# Initialiser les clients LLM
+featherless_client = None
+groq_client = None
+
+if FEATHERLESS_API_KEY:
+    try:
+        featherless_client = OpenAI(
+            base_url="https://api.featherless.ai/v1",
+            api_key=FEATHERLESS_API_KEY,
+            timeout=5.0
+        )
+        print("[LLM] Featherless client initialized")
+    except Exception as e:
+        print(f"[LLM] Featherless init failed: {e}")
+
 if GROQ_API_KEY:
-    groq_client = Groq(api_key=GROQ_API_KEY)
-    print("[LLM] Groq client initialized")
-else:
-    groq_client = None
-    print("[LLM WARNING] No Groq API key, LLM recommendations disabled")
+    try:
+        groq_client = Groq(api_key=GROQ_API_KEY)
+        print("[LLM] Groq client initialized")
+    except Exception as e:
+        print(f"[LLM] Groq init failed: {e}")
+
+# Modèles
+FEATHERLESS_MODEL = "openguardrails/OpenGuardrails-Text-4B-0124"
+GROQ_MODEL = "llama-3.3-70b-versatile"
+
+async def get_llm_recommendation(ip: str, score: int, risk_level: str, attack_type: str) -> tuple:
+    """Essaie Featherless d'abord, puis Groq, retourne (recommandation, provider)"""
+    
+    prompt = f"""Analyze this security event and provide a brief, actionable recommendation (max 3 sentences):
+- IP: {ip}
+- Risk Score: {score}/100 ({risk_level})
+- Attack Type: {attack_type}
+
+Give practical advice for the security team. Be concise and professional."""
+    
+    # 1. Essayer Featherless (spécialisé sécurité)
+    if featherless_client:
+        try:
+            response = featherless_client.chat.completions.create(
+                model=FEATHERLESS_MODEL,
+                messages=[
+                    {"role": "system", "content": "You are a cybersecurity expert. Give concise, actionable advice."},
+                    {"role": "user", "content": prompt}
+                ],
+                temperature=0.3,
+                max_tokens=150
+            )
+            recommendation = response.choices[0].message.content.strip()
+            print(f"[LLM] Featherless generated recommendation for {ip}")
+            return recommendation, "Featherless (OpenGuardrails)"
+        except Exception as e:
+            print(f"[LLM] Featherless failed: {e}")
+    
+    # 2. Fallback vers Groq
+    if groq_client:
+        try:
+            response = groq_client.chat.completions.create(
+                model=GROQ_MODEL,
+                messages=[{"role": "user", "content": prompt}],
+                temperature=0.3,
+                max_tokens=150
+            )
+            recommendation = response.choices[0].message.content.strip()
+            print(f"[LLM] Groq generated recommendation for {ip}")
+            return recommendation, "Groq (Llama 3.3 70B)"
+        except Exception as e:
+            print(f"[LLM] Groq failed: {e}")
+    
+    # 3. Pas de LLM disponible
+    return "No LLM available - check API keys", "none"
 
 # Charger les scores IA au démarrage
 try:
@@ -54,38 +120,18 @@ class LogEntry(BaseModel):
     device_type: str = "unknown"
     failed_attempts: int = 0
 
-async def get_llm_recommendation(ip: str, score: int, risk_level: str, attack_type: str) -> str:
-    """Appelle Groq pour obtenir une recommandation de sécurité"""
-    if not groq_client:
-        return "LLM not configured - please add GROQ_API_KEY"
-    
-    try:
-        prompt = f"""You are a cybersecurity expert. Analyze this security event and provide a brief recommendation (max 2 sentences):
-
-- IP: {ip}
-- Risk Score: {score}/100 ({risk_level})
-- Attack Type: {attack_type}
-
-Give practical, actionable advice for the security team. Be concise and professional."""
-        
-        response = groq_client.chat.completions.create(
-            model="llama-3.3-70b-versatile",
-            messages=[{"role": "user", "content": prompt}],
-            temperature=0.3,
-            max_tokens=100
-        )
-        return response.choices[0].message.content.strip()
-    except Exception as e:
-        print(f"[LLM ERROR] {e}")
-        return "Unable to generate recommendation"
-
 @app.get("/")
 def root():
-    return {"message": "API running with AI + LLM"}
+    return {"message": "Mobile API Misuse Detector with Multi-LLM"}
 
 @app.get("/health")
 def health():
-    return {"status": "ok", "llm_available": groq_client is not None}
+    return {
+        "status": "ok",
+        "llm_available": featherless_client is not None or groq_client is not None,
+        "featherless": featherless_client is not None,
+        "groq": groq_client is not None
+    }
 
 @app.post("/api/v1/analyze")
 async def analyze(entry: LogEntry):
@@ -145,11 +191,15 @@ async def analyze(entry: LogEntry):
     else:
         attack_type = "none"
 
-    # Générer recommandation LLM pour les scores critiques
+    # Générer recommandation LLM (score >= 75)
     llm_recommendation = ""
-    if final_score >= 75 and groq_client:
-        llm_recommendation = await get_llm_recommendation(entry.ip, final_score, risk_level, attack_type)
+    llm_provider = ""
+    if final_score >= 75:
+        llm_recommendation, llm_provider = await get_llm_recommendation(
+            entry.ip, final_score, risk_level, attack_type
+        )
 
+    # Alerte Slack
     if final_score >= 90:
         r.lpush("alerts", f"{entry.ip}|{final_score}|{entry.endpoint}")
 
@@ -201,11 +251,11 @@ async def analyze(entry: LogEntry):
             }
             
             # Ajouter recommandation LLM si disponible
-            if llm_recommendation:
+            if llm_recommendation and llm_recommendation != "No LLM available - check API keys":
                 slack_msg["blocks"].append({"type": "divider"})
                 slack_msg["blocks"].append({
                     "type": "section",
-                    "text": {"type": "mrkdwn", "text": f"*🤖 LLM Recommendation:*\n{llm_recommendation}"}
+                    "text": {"type": "mrkdwn", "text": f"*🤖 LLM Recommendation ({llm_provider}):*\n{llm_recommendation}"}
                 })
             
             slack_msg["blocks"].append({
@@ -220,6 +270,7 @@ async def analyze(entry: LogEntry):
             except Exception as e:
                 print(f"[SLACK WARNING] {e}")
 
+    # Indexer dans Elasticsearch
     log_doc = {
         "timestamp": datetime.utcnow().isoformat() + "Z",
         "ip": entry.ip,
@@ -244,7 +295,8 @@ async def analyze(entry: LogEntry):
         "is_mobile": entry.is_mobile,
         "platform": entry.platform,
         "blocked": final_score >= 90,
-        "llm_recommendation": llm_recommendation
+        "llm_recommendation": llm_recommendation,
+        "llm_provider": llm_provider
     }
 
     try:
@@ -263,7 +315,8 @@ async def analyze(entry: LogEntry):
         "risk_level": risk_level,
         "action": action,
         "attack_type": attack_type,
-        "llm_recommendation": llm_recommendation if final_score >= 75 else None
+        "llm_recommendation": llm_recommendation if final_score >= 75 else None,
+        "llm_provider": llm_provider if final_score >= 75 else None
     }
 
 @app.get("/api/v1/status/{ip}")
@@ -289,6 +342,38 @@ async def top_threats(limit: int = 10):
     ]
     return sorted(threats, key=lambda x: x["score"], reverse=True)[:limit]
 
+@app.get("/api/v1/test-llm")
+async def test_llm():
+    """Test endpoint pour comparer les deux LLM"""
+    test_ip = "93.110.220.181"
+    results = {"status": "testing", "featherless": None, "groq": None}
+    
+    if featherless_client:
+        try:
+            response = featherless_client.chat.completions.create(
+                model=FEATHERLESS_MODEL,
+                messages=[{"role": "user", "content": f"What action for IP {test_ip} with score 94? Answer in 10 words."}],
+                max_tokens=30,
+                temperature=0.3
+            )
+            results["featherless"] = response.choices[0].message.content.strip()
+        except Exception as e:
+            results["featherless"] = f"Error: {str(e)[:50]}"
+    
+    if groq_client:
+        try:
+            response = groq_client.chat.completions.create(
+                model=GROQ_MODEL,
+                messages=[{"role": "user", "content": f"What action for IP {test_ip} with score 94? Answer in 10 words."}],
+                max_tokens=30,
+                temperature=0.3
+            )
+            results["groq"] = response.choices[0].message.content.strip()
+        except Exception as e:
+            results["groq"] = f"Error: {str(e)[:50]}"
+    
+    return results
+
 def get_risk_level(score: int) -> str:
     if score < 40: return "normal"
     if score < 60: return "suspect"
@@ -300,5 +385,4 @@ def get_action(score: int) -> str:
     if score < 40: return "log_only"
     if score < 60: return "rate_limit_soft"
     if score < 75: return "rate_limit_strict"
-    if score < 90: return "rate_limit_strict"
     return "block_and_alert"
