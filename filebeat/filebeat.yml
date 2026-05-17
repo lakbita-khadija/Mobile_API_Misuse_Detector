@@ -3,13 +3,8 @@ filebeat.inputs:
     enabled: true
     paths:
       - /logs/security.log
-    json.keys_under_root: true
-    json.add_error_key: true
 
-output.elasticsearch:
-  hosts: ["elasticsearch:9200"]
-  index: "security-logs-%{+yyyy.MM.dd}"
+output.logstash:
+  hosts: ["logstash:5044"]
 
 setup.ilm.enabled: false
-setup.template.name: "security-logs"
-setup.template.pattern: "security-logs-*"
