@@ -3,7 +3,6 @@ from pydantic import BaseModel
 import redis
 import httpx
 import os
-import requests  # Nouveau pour DeepSeek
 import pandas as pd
 from datetime import datetime
 from app.response.ratelimit import token_bucket_check
@@ -12,29 +11,23 @@ from groq import Groq
 ES_URL = "http://elasticsearch:9200"
 SLACK_WEBHOOK = os.getenv("SLACK_WEBHOOK", "")
 GROQ_API_KEY = os.getenv("GROQ_API_KEY", "")
-DEEPSEEK_API_KEY = os.getenv("FEATHERLESS_API_KEY", "")  # Même clé Featherless pour DeepSeek
 
 app = FastAPI(title="Mobile API Misuse Detector")
 r = redis.Redis(host='redis', port=6379, decode_responses=True)
-
-# Configuration DeepSeek
-DEEPSEEK_API_URL = "https://api.featherless.ai/v1/chat/completions"
-DEEPSEEK_MODEL = "deepseek-ai/DeepSeek-V4-Pro"
 
 # Initialiser Groq
 groq_client = None
 if GROQ_API_KEY:
     try:
         groq_client = Groq(api_key=GROQ_API_KEY)
-        print("[LLM] Groq client initialized")
+        print("[LLM] Groq client initialized successfully")
     except Exception as e:
         print(f"[LLM] Groq init failed: {e}")
+else:
+    print("[LLM] No GROQ_API_KEY found")
 
 async def get_llm_recommendation(ip: str, score: int, risk_level: str, attack_type: str) -> tuple:
-    """
-    Génère une recommandation de sécurité.
-    Ordre: DeepSeek d'abord (meilleur raisonnement), puis Groq (fallback)
-    """
+    """Génère une recommandation de sécurité détaillée avec Groq"""
     
     prompt = f"""You are a senior cybersecurity expert analyzing a REAL ATTACK detected by our AI system.
 
@@ -54,38 +47,6 @@ Provide a professional security recommendation with these EXACT sections:
 
 Be specific, actionable, and professional. NEVER say "safe" for attack data. Write in complete sentences."""
 
-    # 1. Essayer DeepSeek-V4-Pro d'abord (meilleur pour raisonnement)
-    if DEEPSEEK_API_KEY:
-        try:
-            headers = {
-                "Authorization": f"Bearer {DEEPSEEK_API_KEY}",
-                "Content-Type": "application/json"
-            }
-            payload = {
-                "model": DEEPSEEK_MODEL,
-                "messages": [{"role": "user", "content": prompt}],
-                "temperature": 0.3,
-                "max_tokens": 500
-            }
-            
-            response = requests.post(
-                DEEPSEEK_API_URL,
-                headers=headers,
-                json=payload,
-                timeout=10
-            )
-            
-            if response.status_code == 200:
-                result = response.json()
-                recommendation = result['choices'][0]['message']['content'].strip()
-                print(f"[LLM] DeepSeek generated recommendation for {ip} ({len(recommendation)} chars)")
-                return recommendation, "DeepSeek-V4-Pro"
-            else:
-                print(f"[LLM] DeepSeek API error: {response.status_code} - {response.text[:100]}")
-        except Exception as e:
-            print(f"[LLM] DeepSeek failed: {e}")
-    
-    # 2. Fallback vers Groq
     if groq_client:
         try:
             response = groq_client.chat.completions.create(
@@ -103,8 +64,7 @@ Be specific, actionable, and professional. NEVER say "safe" for attack data. Wri
         except Exception as e:
             print(f"[LLM] Groq failed: {e}")
     
-    # 3. Pas de LLM disponible
-    return "BLOCK THIS IP IMMEDIATELY - Attack detected. Review authentication logs and implement rate limiting.", "none"
+    return "BLOCK THIS IP IMMEDIATELY - Attack detected. Review authentication logs and implement rate limiting.", "Fallback (No LLM)"
 
 # Charger les scores IA au démarrage
 try:
@@ -139,15 +99,14 @@ class LogEntry(BaseModel):
 
 @app.get("/")
 def root():
-    return {"message": "Mobile API Misuse Detector with Groq + DeepSeek"}
+    return {"message": "Mobile API Misuse Detector with Groq LLM"}
 
 @app.get("/health")
 def health():
     return {
         "status": "ok",
-        "llm_available": groq_client is not None or bool(DEEPSEEK_API_KEY),
-        "groq": groq_client is not None,
-        "deepseek": bool(DEEPSEEK_API_KEY)
+        "llm_available": groq_client is not None,
+        "groq": groq_client is not None
     }
 
 @app.post("/api/v1/analyze")
@@ -213,7 +172,7 @@ async def analyze(entry: LogEntry):
     else:
         attack_type = "none"
 
-    # Générer recommandation LLM pour scores critiques
+    # Générer recommandation LLM pour scores critiques (>=75)
     llm_recommendation = ""
     llm_provider = ""
     if final_score >= 75:
@@ -221,7 +180,7 @@ async def analyze(entry: LogEntry):
             entry.ip, final_score, risk_level, attack_type
         )
 
-    # Alerte Slack pour scores critiques
+    # Alerte Slack pour scores critiques (>=90)
     if final_score >= 90:
         r.lpush("alerts", f"{entry.ip}|{final_score}|{entry.endpoint}")
 
@@ -233,7 +192,7 @@ async def analyze(entry: LogEntry):
                 "blocks": [
                     {
                         "type": "header",
-                        "text": {"type": "plain_text", "text": "🚨 SECURITY ALERT — Mobile API Misuse Detector"}
+                        "text": {"type": "plain_text", "text": "SECURITY ALERT — Mobile API Misuse Detector"}
                     },
                     {"type": "divider"},
                     {
@@ -272,17 +231,17 @@ async def analyze(entry: LogEntry):
                 ]
             }
             
-            # Ajouter la recommandation LLM
+            # Ajouter la recommandation LLM si disponible
             if llm_recommendation and "BLOCK" not in llm_recommendation:
                 slack_msg["blocks"].append({"type": "divider"})
                 slack_msg["blocks"].append({
                     "type": "section",
-                    "text": {"type": "mrkdwn", "text": f"*🤖 LLM RECOMMENDATION ({llm_provider})*\n{llm_recommendation}"}
+                    "text": {"type": "mrkdwn", "text": f"*LLM Recommendation ({llm_provider})*\n{llm_recommendation}"}
                 })
             
             slack_msg["blocks"].append({
                 "type": "context",
-                "elements": [{"type": "mrkdwn", "text": f"Detected at {datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S')} UTC | Groq + DeepSeek Engine"}]
+                "elements": [{"type": "mrkdwn", "text": f"Detected at {datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S')} UTC | Groq LLM Engine"}]
             })
             
             try:
@@ -317,7 +276,7 @@ async def analyze(entry: LogEntry):
         "is_mobile": entry.is_mobile,
         "platform": entry.platform,
         "blocked": final_score >= 90,
-        "llm_recommendation": llm_recommendation[:1000],
+        "llm_recommendation": llm_recommendation[:1000] if llm_recommendation else "",
         "llm_provider": llm_provider
     }
 
@@ -366,42 +325,19 @@ async def top_threats(limit: int = 10):
 
 @app.get("/api/v1/test-llm")
 async def test_llm():
-    """Test endpoint pour comparer DeepSeek et Groq"""
-    test_ip = "93.110.220.181"
-    results = {"status": "testing", "deepseek": None, "groq": None}
-    
-    prompt = "IP 93.110.220.181 risk score 94/100 bruteforce attack. Give immediate action in 15 words."
-    
-    # Test DeepSeek
-    if DEEPSEEK_API_KEY:
-        try:
-            headers = {"Authorization": f"Bearer {DEEPSEEK_API_KEY}", "Content-Type": "application/json"}
-            payload = {
-                "model": DEEPSEEK_MODEL,
-                "messages": [{"role": "user", "content": prompt}],
-                "max_tokens": 50,
-                "temperature": 0.3
-            }
-            response = requests.post(DEEPSEEK_API_URL, headers=headers, json=payload, timeout=10)
-            if response.status_code == 200:
-                results["deepseek"] = response.json()['choices'][0]['message']['content'].strip()
-        except Exception as e:
-            results["deepseek"] = f"Error: {str(e)[:50]}"
-    
-    # Test Groq
+    """Test endpoint pour vérifier que Groq fonctionne"""
     if groq_client:
         try:
             response = groq_client.chat.completions.create(
                 model="llama-3.3-70b-versatile",
-                messages=[{"role": "user", "content": prompt}],
-                max_tokens=50,
-                temperature=0.3
+                messages=[{"role": "user", "content": "Say: GROQ IS WORKING PROPERLY"}],
+                max_tokens=20,
+                temperature=0
             )
-            results["groq"] = response.choices[0].message.content.strip()
+            return {"status": "ok", "groq": response.choices[0].message.content.strip()}
         except Exception as e:
-            results["groq"] = f"Error: {str(e)[:50]}"
-    
-    return results
+            return {"status": "error", "groq": str(e)}
+    return {"status": "error", "groq": "GROQ_API_KEY not configured"}
 
 def get_risk_level(score: int) -> str:
     if score < 40: return "normal"
