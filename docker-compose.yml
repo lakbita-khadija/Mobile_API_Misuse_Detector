@@ -36,3 +36,20 @@ services:
     image: grafana/grafana:latest
     ports:
       - "3000:3000"
+
+# Logstash
+  logstash:
+    image: logstash:8.11.0
+    volumes:
+      - ./logstash/pipeline:/usr/share/logstash/pipeline
+    depends_on: [elasticsearch]
+    restart: unless-stopped
+
+  # Filebeat
+  filebeat:
+    image: elastic/filebeat:8.11.0
+    volumes:
+      - ./logs:/logs
+      - ./filebeat/filebeat.yml:/usr/share/filebeat/filebeat.yml:ro
+    depends_on: [logstash]
+    restart: unless-stopped
