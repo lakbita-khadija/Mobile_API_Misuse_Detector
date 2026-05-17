@@ -2,11 +2,13 @@ from fastapi import FastAPI
 from pydantic import BaseModel
 import redis
 import httpx
+import os
 import pandas as pd
 from datetime import datetime
 from app.response.ratelimit import token_bucket_check
 
 ES_URL = "http://elasticsearch:9200"
+SLACK_WEBHOOK = os.getenv("SLACK_WEBHOOK", "")
 
 app = FastAPI(title="Mobile API Misuse Detector")
 r = redis.Redis(host='redis', port=6379, decode_responses=True)
@@ -106,10 +108,6 @@ async def analyze(entry: LogEntry):
     # Sauvegarder le score dans Redis
     r.set(f"score:{entry.ip}", final_score)
 
-    # Alerte si score critique
-    if final_score >= 90:
-        r.lpush("alerts", f"{entry.ip}|{final_score}|{entry.endpoint}")
-
     # Déterminer attack_type
     if entry.failed_attempts >= 3 or (entry.status == 401 and "python-requests" in entry.user_agent.lower()):
         attack_type = "bruteforce"
@@ -121,6 +119,31 @@ async def analyze(entry: LogEntry):
         attack_type = "bruteforce"
     else:
         attack_type = "none"
+
+    # Alerte Redis + Slack si score critique
+    if final_score >= 90:
+        r.lpush("alerts", f"{entry.ip}|{final_score}|{entry.endpoint}")
+
+        # Alerte Slack
+        if SLACK_WEBHOOK:
+            slack_msg = {
+                "text": f"🚨 *ATTAQUE DÉTECTÉE*\n"
+                        f"• IP: `{entry.ip}`\n"
+                        f"• Score: `{final_score}/100`\n"
+                        f"• Rule Score: `{score}`\n"
+                        f"• AI Score: `{ai_score}` ({ai_level})\n"
+                        f"• Type: `{attack_type}`\n"
+                        f"• Endpoint: `{entry.endpoint}`\n"
+                        f"• Pays: `{entry.country}`\n"
+                        f"• Device: `{entry.device_model}`\n"
+                        f"• Action: `block_and_alert` 🔒"
+            }
+            try:
+                async with httpx.AsyncClient() as client:
+                    await client.post(SLACK_WEBHOOK, json=slack_msg, timeout=3)
+                    print(f"[SLACK] Alerte envoyée pour {entry.ip}")
+            except Exception as e:
+                print(f"[SLACK WARNING] {e}")
 
     # Indexer dans Elasticsearch
     log_doc = {
