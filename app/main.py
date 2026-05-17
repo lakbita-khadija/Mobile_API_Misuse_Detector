@@ -15,13 +15,9 @@ GROQ_API_KEY = os.getenv("GROQ_API_KEY", "")
 app = FastAPI(title="Mobile API Misuse Detector", version="3.0.0")
 r = redis.Redis(host='redis', port=6379, decode_responses=True)
 
-# IPs jamais bloquées
-WHITELIST_IPS = {"127.0.0.1", "::1", "0.0.0.0", "localhost"}
-
 # =========================
 # INITIALISATION GROQ LLM
 # =========================
-
 groq_client = None
 if GROQ_API_KEY:
     try:
@@ -35,7 +31,6 @@ else:
 # =========================
 # CHARGEMENT DES SCORES IA
 # =========================
-
 try:
     ai_scores_df = pd.read_csv("/app/data/processed/final_risk_scores.csv")
     ai_scores  = dict(zip(ai_scores_df['ip'], ai_scores_df['risk_score']))
@@ -51,7 +46,6 @@ except Exception as e:
 # =========================
 # MODELE LOG
 # =========================
-
 class LogEntry(BaseModel):
     ip: str
     method: str
@@ -69,7 +63,6 @@ class LogEntry(BaseModel):
 # =========================
 # FONCTION LLM
 # =========================
-
 async def get_llm_recommendation(ip: str, score: int, risk_level: str,
                                   attack_type: str, endpoint: str) -> tuple:
     prompt = f"""You are a senior cybersecurity expert analyzing a REAL ATTACK.
@@ -88,46 +81,45 @@ Provide a recommendation with EXACTLY these 3 sections:
 
 [STRATEGIC MITIGATION] - Long-term improvements
 
-Be concise and professional. Never say "safe"."""
+Be concise and professional."""
 
     if groq_client:
         try:
             response = groq_client.chat.completions.create(
                 model="llama-3.3-70b-versatile",
                 messages=[
-                    {"role": "system", "content": "You are a cybersecurity expert. Provide actionable recommendations in 3 sections: IMMEDIATE ACTION, INVESTIGATION, STRATEGIC MITIGATION."},
+                    {"role": "system", "content": "You are a cybersecurity expert. Provide actionable recommendations."},
                     {"role": "user", "content": prompt}
                 ],
                 temperature=0.3,
                 max_tokens=500
             )
             rec = response.choices[0].message.content.strip()
-            print(f"[LLM] Groq recommendation for {ip} ({len(rec)} chars)")
+            print(f"[LLM] Recommendation generated for {ip}")
             return rec, "Groq (Llama 3.3 70B)"
         except Exception as e:
             print(f"[LLM] Groq failed: {e}")
 
     return (
-        "BLOCK THIS IP IMMEDIATELY — Attack detected. "
-        "Review authentication logs and implement rate limiting.",
-        "Fallback (No LLM)"
+        "[IMMEDIATE ACTION] Block this IP immediately.\n"
+        "[INVESTIGATION] Review authentication logs.\n"
+        "[STRATEGIC MITIGATION] Implement rate limiting and WAF rules.",
+        "Fallback"
     )
 
 # =========================
 # SLACK BLOCK KIT
 # =========================
-
 def build_slack_alert(entry: LogEntry, final_score: int, risk_level: str,
                       attack_type: str, llm_recommendation: str,
                       llm_provider: str) -> dict:
 
-    # Barre de score (20 caractères)
     filled = final_score // 5
     score_bar = "█" * filled + "░" * (20 - filled)
 
     risk_emoji = {
-        "normal":   "🟢", "suspect": "🟡",
-        "high":     "🟠", "critical": "🔴", "attack": "🚨"
+        "normal": "🟢", "suspect": "🟡",
+        "high": "🟠", "critical": "🔴", "attack": "🚨"
     }.get(risk_level, "⚪")
 
     attack_emoji = {
@@ -135,12 +127,11 @@ def build_slack_alert(entry: LogEntry, final_score: int, risk_level: str,
         "enumeration": "🔍", "none": "❓"
     }.get(attack_type, "⚠️")
 
-    country  = entry.country   if entry.country   not in ("unknown", "") else "N/A"
-    device   = entry.device_model if entry.device_model not in ("unknown", "") else entry.user_agent[:40]
+    country = entry.country if entry.country not in ("unknown", "") else "N/A"
+    device  = entry.device_model if entry.device_model not in ("unknown", "") else entry.user_agent[:40]
     detected = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
 
     blocks = [
-        # ── Header ──────────────────────────────────────────
         {
             "type": "header",
             "text": {
@@ -149,8 +140,6 @@ def build_slack_alert(entry: LogEntry, final_score: int, risk_level: str,
                 "emoji": True
             }
         },
-
-        # ── Score + barre ────────────────────────────────────
         {
             "type": "section",
             "text": {
@@ -158,48 +147,36 @@ def build_slack_alert(entry: LogEntry, final_score: int, risk_level: str,
                 "text": f"*Risk Score: `{final_score}/100` — {risk_level.upper()}*\n`{score_bar}` {final_score}%"
             }
         },
-
         {"type": "divider"},
-
-        # ── Champs principaux (2 colonnes) ───────────────────
         {
             "type": "section",
             "fields": [
-                {"type": "mrkdwn", "text": f"🌐 *IP Address*\n`{entry.ip}`"},
-                {"type": "mrkdwn", "text": f"🏳️ *Country*\n{country}"},
+                {"type": "mrkdwn", "text": f"*IP Address*\n`{entry.ip}`"},
+                {"type": "mrkdwn", "text": f"*Country*\n{country}"},
                 {"type": "mrkdwn", "text": f"{attack_emoji} *Attack Type*\n`{attack_type}`"},
-                {"type": "mrkdwn", "text": f"📍 *Endpoint*\n`{entry.endpoint}`"},
-                {"type": "mrkdwn", "text": f"🔧 *Method*\n`{entry.method}`"},
-                {"type": "mrkdwn", "text": f"📱 *Device*\n{device}"},
+                {"type": "mrkdwn", "text": f"*Endpoint*\n`{entry.endpoint}`"},
+                {"type": "mrkdwn", "text": f"*Method*\n`{entry.method}`"},
+                {"type": "mrkdwn", "text": f"*Device*\n{device}"},
             ]
         },
-
         {"type": "divider"},
     ]
 
-    # ── LLM Recommendation ───────────────────────────────────
     if llm_recommendation:
         blocks.append({
             "type": "section",
             "text": {
                 "type": "mrkdwn",
-                "text": (
-                    f"🤖 *LLM Recommendation* — _{llm_provider}_\n\n"
-                    f"{llm_recommendation[:2800]}"
-                )
+                "text": f"*LLM Recommendation* — _{llm_provider}_\n\n{llm_recommendation[:2800]}"
             }
         })
         blocks.append({"type": "divider"})
 
-    # ── Action + footer ──────────────────────────────────────
     blocks.append({
         "type": "section",
         "text": {
             "type": "mrkdwn",
-            "text": (
-                f"*Action:* 🔒 `block_and_alert` — IP bloquée *15 minutes*\n"
-                f"_Detected at {detected} UTC · Groq LLM Engine_"
-            )
+            "text": f"*Action:* `block_and_alert` — IP blocked for 15 minutes\n_Detected at {detected} UTC_"
         }
     })
 
@@ -211,10 +188,12 @@ def build_slack_alert(entry: LogEntry, final_score: int, risk_level: str,
 # =========================
 # ROUTES
 # =========================
-
 @app.get("/")
 def root():
-    return {"message": "Mobile API Misuse Detector with Rules + AI + Groq LLM", "version": "3.0.0"}
+    return {
+        "message": "Mobile API Misuse Detector — Rules + AI + Groq LLM",
+        "version": "3.0.0"
+    }
 
 @app.get("/health")
 def health():
@@ -243,13 +222,9 @@ async def test_llm():
 @app.post("/api/v1/analyze")
 async def analyze(entry: LogEntry):
 
-    # ── Whitelist localhost ──────────────────────────────────
-    if entry.ip in WHITELIST_IPS:
-        return {
-            "ip": entry.ip, "score": 0, "risk_level": "normal",
-            "action": "log_only", "attack_type": "none",
-            "blocked": False, "message": "Whitelisted IP — skipped"
-        }
+    # Nettoyer l'IP
+    clean_ip = entry.ip.replace("::ffff:", "").strip()
+    entry.ip = clean_ip
 
     # =========================
     # DETECTION RULE-BASED
@@ -276,13 +251,13 @@ async def analyze(entry: LogEntry):
     # =========================
     # SCORES IA
     # =========================
-    ai_score     = ai_scores.get(entry.ip, 0)
-    ai_level     = ai_levels.get(entry.ip, "unknown")
-    iso_score    = ai_iso.get(entry.ip, 0)
-    dbscan_score = ai_dbscan.get(entry.ip, 0)
-    ae_score     = ai_ae.get(entry.ip, 0)
+    ai_score     = ai_scores.get(clean_ip, 0)
+    ai_level     = ai_levels.get(clean_ip, "unknown")
+    iso_score    = ai_iso.get(clean_ip, 0)
+    dbscan_score = ai_dbscan.get(clean_ip, 0)
+    ae_score     = ai_ae.get(clean_ip, 0)
 
-    # Score final : 60% règles + 40% IA (si dispo)
+    # Score final : 60% règles + 40% IA
     if ai_score > 0:
         final_score = int((rule_score * 0.6) + (ai_score * 100 * 0.4))
         final_score = min(final_score, 100)
@@ -291,30 +266,6 @@ async def analyze(entry: LogEntry):
 
     action     = get_action(final_score)
     risk_level = get_risk_level(final_score)
-
-    # =========================
-    # IP DÉJÀ BLOQUÉE ?
-    # =========================
-    if r.exists(f"block:{entry.ip}"):
-        return {
-            "ip": entry.ip, "score": final_score,
-            "risk_level": risk_level, "action": "blocked",
-            "attack_type": "none",
-            "message": "IP is currently blocked. Please wait 15 minutes."
-        }
-
-    # =========================
-    # RATE LIMITING
-    # =========================
-    if final_score >= 60:
-        limit = 20 if final_score < 90 else 5
-        allowed, remaining = token_bucket_check(entry.ip, limit, 60, r)
-        if not allowed:
-            action = "blocked"
-            r.setex(f"block:{entry.ip}", 900, 1)
-            print(f"[REDIS] Rate limit exceeded — {entry.ip} blocked 15 min")
-
-    r.set(f"score:{entry.ip}", final_score)
 
     # =========================
     # TYPE D'ATTAQUE
@@ -331,21 +282,32 @@ async def analyze(entry: LogEntry):
         attack_type = "none"
 
     # =========================
-    # LLM RECOMMANDATION
+    # RATE LIMITING
+    # =========================
+    if final_score >= 60:
+        limit = 20 if final_score < 90 else 5
+        allowed, remaining = token_bucket_check(entry.ip, limit, 60, r)
+        if not allowed:
+            action = "blocked"
+            r.setex(f"block:{entry.ip}", 900, 1)
+
+    r.set(f"score:{entry.ip}", final_score)
+
+    # =========================
+    # LLM RECOMMANDATION (score >= 60)
     # =========================
     llm_recommendation = ""
     llm_provider = ""
-    if final_score >= 75:
+    if final_score >= 60:
         llm_recommendation, llm_provider = await get_llm_recommendation(
             entry.ip, final_score, risk_level, attack_type, entry.endpoint
         )
 
     # =========================
-    # BLOCAGE + ALERTE SLACK
+    # BLOCAGE + ALERTE SLACK (score >= 75)
     # =========================
-    if final_score >= 90:
+    if final_score >= 75:
         r.setex(f"block:{entry.ip}", 900, 1)
-        print(f"[REDIS] IP {entry.ip} BLOCKED 15 min (score={final_score})")
         r.lpush("alerts", f"{entry.ip}|{final_score}|{entry.endpoint}")
 
         alert_key = f"alerted:{entry.ip}"
@@ -393,7 +355,7 @@ async def analyze(entry: LogEntry):
         "risk_level":         risk_level,
         "attack_type":        attack_type,
         "action":             action,
-        "blocked":            final_score >= 90,
+        "blocked":            final_score >= 75,
         "llm_recommendation": llm_recommendation[:2000] if llm_recommendation else "",
         "llm_provider":       llm_provider
     }
@@ -404,28 +366,24 @@ async def analyze(entry: LogEntry):
                 f"{ES_URL}/mobile-api-logs-{datetime.utcnow().strftime('%Y.%m.%d')}/_doc",
                 json=log_doc, timeout=5
             )
-        print(f"[ES] Log indexed for {entry.ip}")
+        print(f"[ES] Indexed {entry.ip} score={final_score} action={action}")
     except Exception as e:
         print(f"[ES WARNING] {e}")
 
-    # =========================
-    # RÉPONSE API — score uniquement (pas AI score séparé)
-    # =========================
     return {
-        "ip":            entry.ip,
-        "score":         final_score,
-        "risk_level":    risk_level,
-        "action":        action,
-        "attack_type":   attack_type,
-        "blocked":       final_score >= 90,
-        "llm_provider":  llm_provider,
-        "llm_recommendation": llm_recommendation if final_score >= 75 else None
+        "ip":                 entry.ip,
+        "score":              final_score,
+        "risk_level":         risk_level,
+        "action":             action,
+        "attack_type":        attack_type,
+        "blocked":            final_score >= 75,
+        "llm_provider":       llm_provider,
+        "llm_recommendation": llm_recommendation if final_score >= 60 else None
     }
 
 # =========================
-# ROUTES SUPPLÉMENTAIRES
+# ROUTES SUPPLEMENTAIRES
 # =========================
-
 @app.get("/api/v1/status/{ip}")
 async def status(ip: str):
     return {
@@ -452,16 +410,15 @@ async def top_threats(limit: int = 10):
 # =========================
 # UTILITAIRES
 # =========================
-
 def get_risk_level(score: int) -> str:
-    if score < 40:  return "normal"
-    if score < 60:  return "suspect"
-    if score < 75:  return "high"
-    if score < 90:  return "critical"
+    if score < 40: return "normal"
+    if score < 60: return "suspect"
+    if score < 75: return "high"
+    if score < 90: return "critical"
     return "attack"
 
 def get_action(score: int) -> str:
-    if score < 40:  return "log_only"
-    if score < 60:  return "rate_limit_soft"
-    if score < 75:  return "rate_limit_strict"
+    if score < 40: return "log_only"
+    if score < 60: return "rate_limit_soft"
+    if score < 75: return "rate_limit_strict"
     return "block_and_alert"
