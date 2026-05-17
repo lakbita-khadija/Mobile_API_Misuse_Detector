@@ -113,40 +113,125 @@ Be specific, actionable, and professional. NEVER say "safe" for attack data. Wri
     return "BLOCK THIS IP IMMEDIATELY - Attack detected. Review authentication logs and implement rate limiting.", "Fallback (No LLM)"
 
 # =========================
-# FONCTION POUR CONSTRUIRE LE MESSAGE SLACK
+# FONCTION POUR CONSTRUIRE LE MESSAGE SLACK (Block Kit)
 # =========================
 
-def build_slack_alert(entry: LogEntry, final_score: int, risk_level: str, attack_type: str,
-                      rule_score: int, ai_score: float, ai_level: str, llm_recommendation: str,
-                      llm_provider: str) -> dict:
-    """Construit le message Slack exactement comme demandé"""
-    
-    # Construction du message texte simple (pas de blocks complexes)
-    message = f"""SECURITY ALERT — Mobile API Misuse Detector
+def build_slack_alert(
+    entry: LogEntry,
+    final_score: int,
+    risk_level: str,
+    attack_type: str,
+    rule_score: int,
+    ai_score: float,
+    ai_level: str,
+    llm_recommendation: str,
+    llm_provider: str
+) -> dict:
+    """
+    Construit un message Slack structuré avec Block Kit.
+    Rendu visuel : header coloré, champs en grille 2 colonnes,
+    barre de score, bloc LLM distinct, bouton d'action.
+    """
 
-IP Address: {entry.ip}
-Country: {entry.country if entry.country else 'unknown'}
-Risk Score: {final_score}/100 — {risk_level.upper()}
-Attack Type: {attack_type}
-Endpoint: {entry.endpoint}
-Method: {entry.method}
-Device: {entry.device_model if entry.device_model else 'unknown'}
-User Agent: {entry.user_agent[:50]}
+    score_bar = "█" * (final_score // 10) + "░" * (10 - final_score // 10)
 
-Action: block_and_alert — IP blocked for 15 minutes
+    risk_emoji = {
+        "normal":   "🟢",
+        "suspect":  "🟡",
+        "high":     "🟠",
+        "critical": "🔴",
+        "attack":   "🚨",
+    }.get(risk_level, "⚪")
 
-LLM Recommendation ({llm_provider})"""
+    attack_emoji = {
+        "bruteforce":    "🔑",
+        "sql_injection": "💉",
+        "enumeration":   "🔍",
+        "none":          "❓",
+    }.get(attack_type, "⚠️")
 
+    country = entry.country if entry.country and entry.country != "unknown" else "N/A"
+    device  = entry.device_model if entry.device_model and entry.device_model != "unknown" else entry.user_agent[:40]
+
+    blocks = [
+        # ── HEADER ──────────────────────────────────────────────────
+        {
+            "type": "header",
+            "text": {
+                "type": "plain_text",
+                "text": f"{risk_emoji} Security Alert — {risk_level.upper()} Threat Detected",
+                "emoji": True
+            }
+        },
+
+        # ── SCORE + BARRE ────────────────────────────────────────────
+        {
+            "type": "section",
+            "text": {
+                "type": "mrkdwn",
+                "text": (
+                    f"*Risk Score:* `{final_score}/100` — *{risk_level.upper()}*\n"
+                    f"`{score_bar}` {final_score}%"
+                )
+            }
+        },
+
+        {"type": "divider"},
+
+        # ── CHAMPS PRINCIPAUX (2 colonnes) ───────────────────────────
+        {
+            "type": "section",
+            "fields": [
+                {"type": "mrkdwn", "text": f"*🌐 IP Address*\n`{entry.ip}`"},
+                {"type": "mrkdwn", "text": f"*🏳️ Country*\n{country}"},
+                {"type": "mrkdwn", "text": f"*{attack_emoji} Attack Type*\n`{attack_type}`"},
+                {"type": "mrkdwn", "text": f"*📍 Endpoint*\n`{entry.endpoint}`"},
+                {"type": "mrkdwn", "text": f"*🔧 Method*\n`{entry.method}`"},
+                {"type": "mrkdwn", "text": f"*📱 Device*\n{device}"},
+            ]
+        },
+
+        {"type": "divider"},
+
+        # ── SCORES DÉTAILLÉS ─────────────────────────────────────────
+        {
+            "type": "section",
+            "fields": [
+                {"type": "mrkdwn", "text": f"*Rule Score*\n`{rule_score}/100`"},
+                {"type": "mrkdwn", "text": f"*AI Score*\n`{round(ai_score * 100)}/100` ({ai_level})"},
+            ]
+        },
+
+        {"type": "divider"},
+    ]
+
+    # ── RECOMMANDATION LLM (si disponible) ──────────────────────────
     if llm_recommendation:
-        message += f"""
-{llm_recommendation}"""
+        blocks.append({
+            "type": "section",
+            "text": {
+                "type": "mrkdwn",
+                "text": f"*🤖 LLM Recommendation* — _{llm_provider}_\n\n{llm_recommendation[:2800]}"
+            }
+        })
+        blocks.append({"type": "divider"})
 
-    message += f"""
+    # ── ACTION + FOOTER ──────────────────────────────────────────────
+    blocks.append({
+        "type": "section",
+        "text": {
+            "type": "mrkdwn",
+            "text": (
+                f"*Action taken:* 🔒 `block_and_alert` — IP blocked for *15 minutes*\n"
+                f"_Detected at {datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S')} UTC · Groq LLM Engine_"
+            )
+        }
+    })
 
-Detected at {datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S')} UTC | Groq LLM Engine"""
-
-    # Retourner au format Slack (texte simple)
-    return {"text": message}
+    return {
+        "text": f"[{risk_level.upper()}] Security Alert — {entry.ip} scored {final_score}/100 ({attack_type})",
+        "blocks": blocks
+    }
 
 # =========================
 # ROUTES
@@ -215,11 +300,11 @@ async def analyze(entry: LogEntry):
     # =========================
     # SCORES IA
     # =========================
-    ai_score = ai_scores.get(entry.ip, 0)
-    ai_level = ai_levels.get(entry.ip, "unknown")
+    ai_score  = ai_scores.get(entry.ip, 0)
+    ai_level  = ai_levels.get(entry.ip, "unknown")
     iso_score = ai_iso.get(entry.ip, 0)
     dbscan_score = ai_dbscan.get(entry.ip, 0)
-    ae_score = ai_ae.get(entry.ip, 0)
+    ae_score  = ai_ae.get(entry.ip, 0)
 
     # Score final combiné : 60% règles + 40% IA
     if ai_score > 0:
@@ -228,14 +313,13 @@ async def analyze(entry: LogEntry):
     else:
         final_score = rule_score
 
-    action = get_action(final_score)
+    action     = get_action(final_score)
     risk_level = get_risk_level(final_score)
 
     # =========================
     # VERIFIER SI IP DEJA BLOQUEE
     # =========================
     if r.exists(f"block:{entry.ip}"):
-        action = "blocked"
         return {
             "ip": entry.ip,
             "score": final_score,
@@ -285,43 +369,31 @@ async def analyze(entry: LogEntry):
     # =========================
     # BLOCAGE REDIS + ALERTE SLACK
     # =========================
-
     if final_score >= 90:
         r.setex(f"block:{entry.ip}", 900, 1)
-        print(f"[REDIS] 🔒 IP {entry.ip} BLOCKED for 15 minutes (score={final_score})")
-        
+        print(f"[REDIS] IP {entry.ip} BLOCKED for 15 minutes (score={final_score})")
         r.lpush("alerts", f"{entry.ip}|{final_score}|{entry.endpoint}")
 
-        # Alerte Slack
         alert_key = f"alerted:{entry.ip}"
         if not r.exists(alert_key) and SLACK_WEBHOOK:
             r.setex(alert_key, 900, 1)
 
-            # Construction du message Slack simple
-            slack_message = f"""SECURITY ALERT — Mobile API Misuse Detector
+            slack_payload = build_slack_alert(
+                entry=entry,
+                final_score=final_score,
+                risk_level=risk_level,
+                attack_type=attack_type,
+                rule_score=rule_score,
+                ai_score=ai_score,
+                ai_level=ai_level,
+                llm_recommendation=llm_recommendation,
+                llm_provider=llm_provider
+            )
 
-IP Address: {entry.ip}
-Country: {entry.country if entry.country else 'unknown'}
-Risk Score: {final_score}/100 — {risk_level.upper()}
-Attack Type: {attack_type}
-Endpoint: {entry.endpoint}
-Method: {entry.method}
-Device: {entry.device_model if entry.device_model else 'unknown'}
-User Agent: {entry.user_agent[:50]}
-
-Action: block_and_alert — IP blocked for 15 minutes
-
-LLM Recommendation ({llm_provider})
-{llm_recommendation if llm_recommendation else 'No recommendation available'}
-
-Detected at {datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S')} UTC | Groq LLM Engine"""
-
-            slack_msg = {"text": slack_message}
-            
             try:
                 async with httpx.AsyncClient() as client:
-                    await client.post(SLACK_WEBHOOK, json=slack_msg, timeout=5)
-                    print(f"[SLACK] Alert sent for {entry.ip}")
+                    await client.post(SLACK_WEBHOOK, json=slack_payload, timeout=5)
+                    print(f"[SLACK] Block Kit alert sent for {entry.ip}")
             except Exception as e:
                 print(f"[SLACK WARNING] {e}")
 
@@ -329,32 +401,32 @@ Detected at {datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S')} UTC | Groq LLM Eng
     # INDEX ELASTICSEARCH
     # =========================
     log_doc = {
-        "timestamp": datetime.utcnow().isoformat() + "Z",
-        "ip": entry.ip,
-        "method": entry.method,
-        "endpoint": entry.endpoint,
-        "status": entry.status,
-        "latency_ms": entry.latency_ms,
-        "user_agent": entry.user_agent,
-        "is_mobile": entry.is_mobile,
-        "platform": entry.platform,
-        "country": entry.country,
-        "device_model": entry.device_model,
-        "device_type": entry.device_type,
-        "failed_attempts": entry.failed_attempts,
-        "rule_score": rule_score,
-        "ai_score": ai_score,
-        "ai_level": ai_level,
-        "iso_forest_score": iso_score,
-        "dbscan_score": dbscan_score,
+        "timestamp":         datetime.utcnow().isoformat() + "Z",
+        "ip":                entry.ip,
+        "method":            entry.method,
+        "endpoint":          entry.endpoint,
+        "status":            entry.status,
+        "latency_ms":        entry.latency_ms,
+        "user_agent":        entry.user_agent,
+        "is_mobile":         entry.is_mobile,
+        "platform":          entry.platform,
+        "country":           entry.country,
+        "device_model":      entry.device_model,
+        "device_type":       entry.device_type,
+        "failed_attempts":   entry.failed_attempts,
+        "rule_score":        rule_score,
+        "ai_score":          ai_score,
+        "ai_level":          ai_level,
+        "iso_forest_score":  iso_score,
+        "dbscan_score":      dbscan_score,
         "autoencoder_score": ae_score,
-        "risk_score": final_score,
-        "risk_level": risk_level,
-        "attack_type": attack_type,
-        "action": action,
-        "blocked": final_score >= 90,
+        "risk_score":        final_score,
+        "risk_level":        risk_level,
+        "attack_type":       attack_type,
+        "action":            action,
+        "blocked":           final_score >= 90,
         "llm_recommendation": llm_recommendation[:2000] if llm_recommendation else "",
-        "llm_provider": llm_provider
+        "llm_provider":      llm_provider
     }
 
     try:
@@ -372,19 +444,19 @@ Detected at {datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S')} UTC | Groq LLM Eng
     # RESPONSE API
     # =========================
     return {
-        "ip": entry.ip,
-        "score": final_score,
-        "rule_score": rule_score,
-        "ai_score": ai_score,
-        "ai_level": ai_level,
+        "ip":               entry.ip,
+        "score":            final_score,
+        "rule_score":       rule_score,
+        "ai_score":         ai_score,
+        "ai_level":         ai_level,
         "iso_forest_score": iso_score,
-        "dbscan_score": dbscan_score,
-        "autoencoder_score": ae_score,
-        "risk_level": risk_level,
-        "action": action,
-        "attack_type": attack_type,
-        "blocked": final_score >= 90,
-        "llm_provider": llm_provider,
+        "dbscan_score":     dbscan_score,
+        "autoencoder_score":ae_score,
+        "risk_level":       risk_level,
+        "action":           action,
+        "attack_type":      attack_type,
+        "blocked":          final_score >= 90,
+        "llm_provider":     llm_provider,
         "llm_recommendation": llm_recommendation if final_score >= 75 else None
     }
 
@@ -395,10 +467,10 @@ Detected at {datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S')} UTC | Groq LLM Eng
 @app.get("/api/v1/status/{ip}")
 async def status(ip: str):
     return {
-        "ip": ip,
-        "blocked": bool(r.exists(f"block:{ip}")),
+        "ip":       ip,
+        "blocked":  bool(r.exists(f"block:{ip}")),
         "block_ttl": r.ttl(f"block:{ip}"),
-        "score": int(r.get(f"score:{ip}") or 0)
+        "score":    int(r.get(f"score:{ip}") or 0)
     }
 
 @app.delete("/api/v1/block/{ip}")
