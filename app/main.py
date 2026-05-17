@@ -6,12 +6,22 @@ import os
 import pandas as pd
 from datetime import datetime
 from app.response.ratelimit import token_bucket_check
+from groq import Groq
 
 ES_URL = "http://elasticsearch:9200"
 SLACK_WEBHOOK = os.getenv("SLACK_WEBHOOK", "")
+GROQ_API_KEY = os.getenv("GROQ_API_KEY", "")
 
 app = FastAPI(title="Mobile API Misuse Detector")
 r = redis.Redis(host='redis', port=6379, decode_responses=True)
+
+# Initialiser Groq si clé disponible
+if GROQ_API_KEY:
+    groq_client = Groq(api_key=GROQ_API_KEY)
+    print("[LLM] Groq client initialized")
+else:
+    groq_client = None
+    print("[LLM WARNING] No Groq API key, LLM recommendations disabled")
 
 # Charger les scores IA au démarrage
 try:
@@ -44,13 +54,38 @@ class LogEntry(BaseModel):
     device_type: str = "unknown"
     failed_attempts: int = 0
 
+async def get_llm_recommendation(ip: str, score: int, risk_level: str, attack_type: str) -> str:
+    """Appelle Groq pour obtenir une recommandation de sécurité"""
+    if not groq_client:
+        return "LLM not configured - please add GROQ_API_KEY"
+    
+    try:
+        prompt = f"""You are a cybersecurity expert. Analyze this security event and provide a brief recommendation (max 2 sentences):
+
+- IP: {ip}
+- Risk Score: {score}/100 ({risk_level})
+- Attack Type: {attack_type}
+
+Give practical, actionable advice for the security team. Be concise and professional."""
+        
+        response = groq_client.chat.completions.create(
+            model="llama-3.3-70b-versatile",
+            messages=[{"role": "user", "content": prompt}],
+            temperature=0.3,
+            max_tokens=100
+        )
+        return response.choices[0].message.content.strip()
+    except Exception as e:
+        print(f"[LLM ERROR] {e}")
+        return "Unable to generate recommendation"
+
 @app.get("/")
 def root():
-    return {"message": "API running"}
+    return {"message": "API running with AI + LLM"}
 
 @app.get("/health")
 def health():
-    return {"status": "ok"}
+    return {"status": "ok", "llm_available": groq_client is not None}
 
 @app.post("/api/v1/analyze")
 async def analyze(entry: LogEntry):
@@ -110,10 +145,14 @@ async def analyze(entry: LogEntry):
     else:
         attack_type = "none"
 
+    # Générer recommandation LLM pour les scores critiques
+    llm_recommendation = ""
+    if final_score >= 75 and groq_client:
+        llm_recommendation = await get_llm_recommendation(entry.ip, final_score, risk_level, attack_type)
+
     if final_score >= 90:
         r.lpush("alerts", f"{entry.ip}|{final_score}|{entry.endpoint}")
 
-        # Cooldown 15 min — une seule alerte par IP
         alert_key = f"alerted:{entry.ip}"
         if not r.exists(alert_key) and SLACK_WEBHOOK:
             r.setex(alert_key, 900, 1)
@@ -122,14 +161,9 @@ async def analyze(entry: LogEntry):
                 "blocks": [
                     {
                         "type": "header",
-                        "text": {
-                            "type": "plain_text",
-                            "text": "SECURITY ALERT — Mobile API Misuse Detector"
-                        }
+                        "text": {"type": "plain_text", "text": "SECURITY ALERT — Mobile API Misuse Detector"}
                     },
-                    {
-                        "type": "divider"
-                    },
+                    {"type": "divider"},
                     {
                         "type": "section",
                         "fields": [
@@ -158,27 +192,27 @@ async def analyze(entry: LogEntry):
                             {"type": "mrkdwn", "text": f"*User Agent:*\n`{entry.user_agent[:40]}`"}
                         ]
                     },
-                    {
-                        "type": "divider"
-                    },
+                    {"type": "divider"},
                     {
                         "type": "section",
-                        "text": {
-                            "type": "mrkdwn",
-                            "text": f"*Action:* `block_and_alert` — IP blocked for 15 minutes"
-                        }
-                    },
-                    {
-                        "type": "context",
-                        "elements": [
-                            {
-                                "type": "mrkdwn",
-                                "text": f"Detected at {datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S')} UTC | Mobile API Misuse Detector"
-                            }
-                        ]
+                        "text": {"type": "mrkdwn", "text": f"*Action:* `block_and_alert` — IP blocked for 15 minutes"}
                     }
                 ]
             }
+            
+            # Ajouter recommandation LLM si disponible
+            if llm_recommendation:
+                slack_msg["blocks"].append({"type": "divider"})
+                slack_msg["blocks"].append({
+                    "type": "section",
+                    "text": {"type": "mrkdwn", "text": f"*🤖 LLM Recommendation:*\n{llm_recommendation}"}
+                })
+            
+            slack_msg["blocks"].append({
+                "type": "context",
+                "elements": [{"type": "mrkdwn", "text": f"Detected at {datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S')} UTC"}]
+            })
+            
             try:
                 async with httpx.AsyncClient() as client:
                     await client.post(SLACK_WEBHOOK, json=slack_msg, timeout=3)
@@ -209,7 +243,8 @@ async def analyze(entry: LogEntry):
         "failed_attempts": entry.failed_attempts,
         "is_mobile": entry.is_mobile,
         "platform": entry.platform,
-        "blocked": final_score >= 90
+        "blocked": final_score >= 90,
+        "llm_recommendation": llm_recommendation
     }
 
     try:
@@ -227,7 +262,8 @@ async def analyze(entry: LogEntry):
         "score": final_score,
         "risk_level": risk_level,
         "action": action,
-        "attack_type": attack_type
+        "attack_type": attack_type,
+        "llm_recommendation": llm_recommendation if final_score >= 75 else None
     }
 
 @app.get("/api/v1/status/{ip}")
