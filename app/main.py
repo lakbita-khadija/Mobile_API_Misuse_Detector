@@ -2,6 +2,7 @@ from fastapi import FastAPI
 from pydantic import BaseModel
 import redis
 import httpx
+import pandas as pd
 from datetime import datetime
 from app.response.ratelimit import token_bucket_check
 
@@ -9,6 +10,23 @@ ES_URL = "http://elasticsearch:9200"
 
 app = FastAPI(title="Mobile API Misuse Detector")
 r = redis.Redis(host='redis', port=6379, decode_responses=True)
+
+# Charger les scores IA au démarrage
+try:
+    ai_scores_df = pd.read_csv("/app/data/processed/final_risk_scores.csv")
+    ai_scores = dict(zip(ai_scores_df['ip'], ai_scores_df['risk_score']))
+    ai_levels = dict(zip(ai_scores_df['ip'], ai_scores_df['risk_level']))
+    ai_iso = dict(zip(ai_scores_df['ip'], ai_scores_df['iso_anomaly_score']))
+    ai_dbscan = dict(zip(ai_scores_df['ip'], ai_scores_df['dbscan_anomaly_score']))
+    ai_ae = dict(zip(ai_scores_df['ip'], ai_scores_df['ae_anomaly_score']))
+    print(f"[AI] Loaded {len(ai_scores)} IP scores")
+except Exception as e:
+    print(f"[AI WARNING] Could not load scores: {e}")
+    ai_scores = {}
+    ai_levels = {}
+    ai_iso = {}
+    ai_dbscan = {}
+    ai_ae = {}
 
 class LogEntry(BaseModel):
     ip: str
@@ -60,23 +78,37 @@ async def analyze(entry: LogEntry):
 
     score = min(score, 100)
 
-    action = get_action(score)
-    risk_level = get_risk_level(score)
+    # Intégrer le score IA
+    ai_score = ai_scores.get(entry.ip, 0)
+    ai_level = ai_levels.get(entry.ip, "unknown")
+    iso_score = ai_iso.get(entry.ip, 0)
+    dbscan_score = ai_dbscan.get(entry.ip, 0)
+    ae_score = ai_ae.get(entry.ip, 0)
+
+    # Score final combiné : 60% règles + 40% IA
+    if ai_score > 0:
+        final_score = int((score * 0.6) + (ai_score * 100 * 0.4))
+        final_score = min(final_score, 100)
+    else:
+        final_score = score
+
+    action = get_action(final_score)
+    risk_level = get_risk_level(final_score)
 
     # Rate limiting si score >= 60
-    if score >= 60:
-        limit = 20 if score < 90 else 5
+    if final_score >= 60:
+        limit = 20 if final_score < 90 else 5
         allowed, remaining = token_bucket_check(entry.ip, limit, 60, r)
         if not allowed:
             action = "blocked"
             r.setex(f"block:{entry.ip}", 900, 1)
 
     # Sauvegarder le score dans Redis
-    r.set(f"score:{entry.ip}", score)
+    r.set(f"score:{entry.ip}", final_score)
 
     # Alerte si score critique
-    if score >= 90:
-        r.lpush("alerts", f"{entry.ip}|{score}|{entry.endpoint}")
+    if final_score >= 90:
+        r.lpush("alerts", f"{entry.ip}|{final_score}|{entry.endpoint}")
 
     # Déterminer attack_type
     if entry.failed_attempts >= 3 or (entry.status == 401 and "python-requests" in entry.user_agent.lower()):
@@ -90,7 +122,7 @@ async def analyze(entry: LogEntry):
     else:
         attack_type = "none"
 
-    # Indexer dans Elasticsearch avec tous les champs
+    # Indexer dans Elasticsearch
     log_doc = {
         "timestamp": datetime.utcnow().isoformat() + "Z",
         "ip": entry.ip,
@@ -99,7 +131,13 @@ async def analyze(entry: LogEntry):
         "status": entry.status,
         "latency_ms": entry.latency_ms,
         "user_agent": entry.user_agent,
-        "risk_score": score,
+        "risk_score": final_score,
+        "rule_score": score,
+        "ai_score": ai_score,
+        "ai_level": ai_level,
+        "iso_forest_score": iso_score,
+        "dbscan_score": dbscan_score,
+        "autoencoder_score": ae_score,
         "risk_level": risk_level,
         "attack_type": attack_type,
         "country": entry.country,
@@ -108,7 +146,7 @@ async def analyze(entry: LogEntry):
         "failed_attempts": entry.failed_attempts,
         "is_mobile": entry.is_mobile,
         "platform": entry.platform,
-        "blocked": score >= 90
+        "blocked": final_score >= 90
     }
 
     try:
@@ -123,7 +161,10 @@ async def analyze(entry: LogEntry):
 
     return {
         "ip": entry.ip,
-        "score": score,
+        "score": final_score,
+        "rule_score": score,
+        "ai_score": ai_score,
+        "ai_level": ai_level,
         "risk_level": risk_level,
         "action": action,
         "attack_type": attack_type
