@@ -150,13 +150,27 @@ async def analyze(entry: LogEntry):
     action = get_action(final_score)
     risk_level = get_risk_level(final_score)
 
-    # Rate limiting
+    # Vérifier si l'IP est déjà bloquée
+    is_blocked = r.exists(f"block:{entry.ip}")
+    if is_blocked:
+        action = "blocked"
+        return {
+            "ip": entry.ip,
+            "score": final_score,
+            "risk_level": risk_level,
+            "action": "blocked",
+            "attack_type": "none",
+            "message": "IP is currently blocked. Please wait 15 minutes."
+        }
+
+    # Rate limiting (token bucket)
     if final_score >= 60:
         limit = 20 if final_score < 90 else 5
         allowed, remaining = token_bucket_check(entry.ip, limit, 60, r)
         if not allowed:
             action = "blocked"
             r.setex(f"block:{entry.ip}", 900, 1)
+            print(f"[REDIS] Rate limit exceeded - IP {entry.ip} blocked for 15 minutes")
 
     r.set(f"score:{entry.ip}", final_score)
 
@@ -180,8 +194,12 @@ async def analyze(entry: LogEntry):
             entry.ip, final_score, risk_level, attack_type
         )
 
-    # Alerte Slack pour scores critiques (>=90)
+    # BLOCAGE REDIS POUR SCORE >= 90
     if final_score >= 90:
+        # ⚠️ LIGNE CRITIQUE - BLOCAGE REDIS ⚠️
+        r.setex(f"block:{entry.ip}", 900, 1)
+        print(f"[REDIS] 🔒 IP {entry.ip} BLOCKED for 15 minutes (score={final_score})")
+        
         r.lpush("alerts", f"{entry.ip}|{final_score}|{entry.endpoint}")
 
         alert_key = f"alerted:{entry.ip}"
@@ -226,12 +244,12 @@ async def analyze(entry: LogEntry):
                     {"type": "divider"},
                     {
                         "type": "section",
-                        "text": {"type": "mrkdwn", "text": f"*Action:* `{action}` — IP blocked for 15 minutes"}
+                        "text": {"type": "mrkdwn", "text": f"*Action:* `block_and_alert` — IP blocked for 15 minutes"}
                     }
                 ]
             }
             
-            # Ajouter la recommandation LLM si disponible
+            # Ajouter la recommandation LLM
             if llm_recommendation and "BLOCK" not in llm_recommendation:
                 slack_msg["blocks"].append({"type": "divider"})
                 slack_msg["blocks"].append({
