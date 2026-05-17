@@ -335,22 +335,24 @@ async def analyze(entry: LogEntry):
     # SCORES IA
     # =========================
     # Nouveau — score IA en temps réel
-ai_score_realtime, ai_level_realtime = compute_realtime_ai_score(clean_ip, entry)
+    ai_score_realtime, ai_level_realtime = compute_realtime_ai_score(clean_ip, entry)
 
-# Combiner lookup CSV + temps réel
-ai_score_csv = ai_scores.get(clean_ip, 0)
-ai_level_csv = ai_levels.get(clean_ip, "unknown")
+    # Combiner lookup CSV + temps réel
+    ai_score_csv = ai_scores.get(clean_ip, 0)
+    ai_level_csv = ai_levels.get(clean_ip, "unknown")
 
-# Prendre le max des deux
-if ai_score_csv > 0:
-    ai_score = max(ai_score_csv, ai_score_realtime)
-    ai_level = ai_level_csv if ai_score_csv >= ai_score_realtime else ai_level_realtime
-else:
-    ai_score = ai_score_realtime
-    ai_level = ai_level_realtime
+    # Prendre le max des deux
+    # Toujours récupérer iso/dbscan/ae du CSV
     iso_score    = ai_iso.get(clean_ip, 0)
     dbscan_score = ai_dbscan.get(clean_ip, 0)
     ae_score     = ai_ae.get(clean_ip, 0)
+
+    if ai_score_csv > 0:
+        ai_score = max(ai_score_csv, ai_score_realtime)
+        ai_level = ai_level_csv if ai_score_csv >= ai_score_realtime else ai_level_realtime
+    else:
+        ai_score = ai_score_realtime
+        ai_level = ai_level_realtime
 
     # Score final : 60% règles + 40% IA
     if ai_score > 0:

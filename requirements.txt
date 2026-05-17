@@ -8,3 +8,6 @@ python-dotenv
 faker
 pytest
 httpx
+groq
+openai
+requests

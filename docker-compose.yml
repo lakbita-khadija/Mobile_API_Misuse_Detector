@@ -6,8 +6,10 @@ services:
       - "8000:8000"
     volumes:
       - ./data:/app/data
+      - ./models:/app/models
     environment:
       - SLACK_WEBHOOK=${SLACK_WEBHOOK}
+      - GROQ_API_KEY=${GROQ_API_KEY}
     depends_on:
       - redis
   redis:
