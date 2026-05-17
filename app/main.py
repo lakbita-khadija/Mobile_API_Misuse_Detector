@@ -3,35 +3,26 @@ from pydantic import BaseModel
 import redis
 import httpx
 import os
+import requests  # Nouveau pour DeepSeek
 import pandas as pd
 from datetime import datetime
 from app.response.ratelimit import token_bucket_check
-from openai import OpenAI
 from groq import Groq
 
 ES_URL = "http://elasticsearch:9200"
 SLACK_WEBHOOK = os.getenv("SLACK_WEBHOOK", "")
-FEATHERLESS_API_KEY = os.getenv("FEATHERLESS_API_KEY", "")
 GROQ_API_KEY = os.getenv("GROQ_API_KEY", "")
+DEEPSEEK_API_KEY = os.getenv("FEATHERLESS_API_KEY", "")  # Même clé Featherless pour DeepSeek
 
 app = FastAPI(title="Mobile API Misuse Detector")
 r = redis.Redis(host='redis', port=6379, decode_responses=True)
 
-# Initialiser les clients LLM
-featherless_client = None
+# Configuration DeepSeek
+DEEPSEEK_API_URL = "https://api.featherless.ai/v1/chat/completions"
+DEEPSEEK_MODEL = "deepseek-ai/DeepSeek-V4-Pro"
+
+# Initialiser Groq
 groq_client = None
-
-if FEATHERLESS_API_KEY:
-    try:
-        featherless_client = OpenAI(
-            base_url="https://api.featherless.ai/v1",
-            api_key=FEATHERLESS_API_KEY,
-            timeout=10.0
-        )
-        print("[LLM] Featherless client initialized")
-    except Exception as e:
-        print(f"[LLM] Featherless init failed: {e}")
-
 if GROQ_API_KEY:
     try:
         groq_client = Groq(api_key=GROQ_API_KEY)
@@ -39,73 +30,81 @@ if GROQ_API_KEY:
     except Exception as e:
         print(f"[LLM] Groq init failed: {e}")
 
-# Modèles
-FEATHERLESS_MODEL = "openguardrails/OpenGuardrails-Text-4B-0124"
-GROQ_MODEL = "llama-3.3-70b-versatile"
-
 async def get_llm_recommendation(ip: str, score: int, risk_level: str, attack_type: str) -> tuple:
     """
-    Génère une recommandation de sécurité détaillée et actionable.
-    Essaie Featherless d'abord, puis Groq.
-    Retourne: (recommandation, provider_utilisé)
+    Génère une recommandation de sécurité.
+    Ordre: DeepSeek d'abord (meilleur raisonnement), puis Groq (fallback)
     """
     
-    # Prompt professionnel pour une recommandation longue et structurée
-    prompt = f"""You are a senior cybersecurity expert. Analyze this security event and provide a DETAILED, ACTIONABLE recommendation.
+    prompt = f"""You are a senior cybersecurity expert analyzing a REAL ATTACK detected by our AI system.
 
-SECURITY EVENT:
+SECURITY EVENT (CONFIRMED ATTACK - NOT SAFE):
 - IP Address: {ip}
 - Risk Score: {score}/100 ({risk_level.upper()})
-- Attack Type: {attack_type}
+- Attack Type: {attack_type.upper()}
+- This is a MALICIOUS attack, not normal traffic.
 
-Provide a complete response with these THREE sections:
+Provide a professional security recommendation with these EXACT sections:
 
-1. [IMMEDIATE ACTION] - What should be done right now? (blocking, rate limiting, etc.)
+[IMMEDIATE ACTION] - What to do right now (block, rate limit, etc.)
 
-2. [INVESTIGATION] - What logs or patterns should the security team analyze?
+[INVESTIGATION] - What logs and patterns to analyze
 
-3. [STRATEGIC MITIGATION] - What long-term security improvements are recommended?
+[STRATEGIC MITIGATION] - Long-term security improvements
 
-Be specific, professional, and practical. Write in complete sentences."""
+Be specific, actionable, and professional. NEVER say "safe" for attack data. Write in complete sentences."""
 
-    # 1. Essayer Featherless (spécialisé sécurité)
-    if featherless_client:
+    # 1. Essayer DeepSeek-V4-Pro d'abord (meilleur pour raisonnement)
+    if DEEPSEEK_API_KEY:
         try:
-            response = featherless_client.chat.completions.create(
-                model=FEATHERLESS_MODEL,
-                messages=[
-                    {"role": "system", "content": "You are a senior cybersecurity expert. Provide detailed, actionable security recommendations."},
-                    {"role": "user", "content": prompt}
-                ],
-                temperature=0.4,
-                max_tokens=500  # Longue recommandation
+            headers = {
+                "Authorization": f"Bearer {DEEPSEEK_API_KEY}",
+                "Content-Type": "application/json"
+            }
+            payload = {
+                "model": DEEPSEEK_MODEL,
+                "messages": [{"role": "user", "content": prompt}],
+                "temperature": 0.3,
+                "max_tokens": 500
+            }
+            
+            response = requests.post(
+                DEEPSEEK_API_URL,
+                headers=headers,
+                json=payload,
+                timeout=10
             )
-            recommendation = response.choices[0].message.content.strip()
-            print(f"[LLM] Featherless generated detailed recommendation for {ip} ({len(recommendation)} chars)")
-            return recommendation, "Featherless (OpenGuardrails)"
+            
+            if response.status_code == 200:
+                result = response.json()
+                recommendation = result['choices'][0]['message']['content'].strip()
+                print(f"[LLM] DeepSeek generated recommendation for {ip} ({len(recommendation)} chars)")
+                return recommendation, "DeepSeek-V4-Pro"
+            else:
+                print(f"[LLM] DeepSeek API error: {response.status_code} - {response.text[:100]}")
         except Exception as e:
-            print(f"[LLM] Featherless failed: {e}")
+            print(f"[LLM] DeepSeek failed: {e}")
     
     # 2. Fallback vers Groq
     if groq_client:
         try:
             response = groq_client.chat.completions.create(
-                model=GROQ_MODEL,
+                model="llama-3.3-70b-versatile",
                 messages=[
-                    {"role": "system", "content": "You are a senior cybersecurity expert. Provide detailed, actionable security recommendations."},
+                    {"role": "system", "content": "You are a cybersecurity expert analyzing REAL attacks. Never say 'safe'. Provide detailed, actionable recommendations with 3 sections: IMMEDIATE ACTION, INVESTIGATION, STRATEGIC MITIGATION."},
                     {"role": "user", "content": prompt}
                 ],
-                temperature=0.4,
+                temperature=0.3,
                 max_tokens=500
             )
             recommendation = response.choices[0].message.content.strip()
-            print(f"[LLM] Groq generated detailed recommendation for {ip} ({len(recommendation)} chars)")
+            print(f"[LLM] Groq generated recommendation for {ip} ({len(recommendation)} chars)")
             return recommendation, "Groq (Llama 3.3 70B)"
         except Exception as e:
             print(f"[LLM] Groq failed: {e}")
     
     # 3. Pas de LLM disponible
-    return "No LLM available - check API keys. Immediate action: Block IP and investigate logs.", "none"
+    return "BLOCK THIS IP IMMEDIATELY - Attack detected. Review authentication logs and implement rate limiting.", "none"
 
 # Charger les scores IA au démarrage
 try:
@@ -140,15 +139,15 @@ class LogEntry(BaseModel):
 
 @app.get("/")
 def root():
-    return {"message": "Mobile API Misuse Detector with Multi-LLM"}
+    return {"message": "Mobile API Misuse Detector with Groq + DeepSeek"}
 
 @app.get("/health")
 def health():
     return {
         "status": "ok",
-        "llm_available": featherless_client is not None or groq_client is not None,
-        "featherless": featherless_client is not None,
-        "groq": groq_client is not None
+        "llm_available": groq_client is not None or bool(DEEPSEEK_API_KEY),
+        "groq": groq_client is not None,
+        "deepseek": bool(DEEPSEEK_API_KEY)
     }
 
 @app.post("/api/v1/analyze")
@@ -214,10 +213,10 @@ async def analyze(entry: LogEntry):
     else:
         attack_type = "none"
 
-    # Générer recommandation LLM DÉTAILLÉE pour scores élevés
+    # Générer recommandation LLM pour scores critiques
     llm_recommendation = ""
     llm_provider = ""
-    if final_score >= 75:  # Seuil pour LLM (High, Critical, Attack)
+    if final_score >= 75:
         llm_recommendation, llm_provider = await get_llm_recommendation(
             entry.ip, final_score, risk_level, attack_type
         )
@@ -230,7 +229,6 @@ async def analyze(entry: LogEntry):
         if not r.exists(alert_key) and SLACK_WEBHOOK:
             r.setex(alert_key, 900, 1)
 
-            # Construction du message Slack avec recommandation LLM
             slack_msg = {
                 "blocks": [
                     {
@@ -274,8 +272,8 @@ async def analyze(entry: LogEntry):
                 ]
             }
             
-            # Ajouter la recommandation LLM détaillée
-            if llm_recommendation and "No LLM available" not in llm_recommendation:
+            # Ajouter la recommandation LLM
+            if llm_recommendation and "BLOCK" not in llm_recommendation:
                 slack_msg["blocks"].append({"type": "divider"})
                 slack_msg["blocks"].append({
                     "type": "section",
@@ -284,7 +282,7 @@ async def analyze(entry: LogEntry):
             
             slack_msg["blocks"].append({
                 "type": "context",
-                "elements": [{"type": "mrkdwn", "text": f"Detected at {datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S')} UTC | Multi-LLM Security Engine"}]
+                "elements": [{"type": "mrkdwn", "text": f"Detected at {datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S')} UTC | Groq + DeepSeek Engine"}]
             })
             
             try:
@@ -319,7 +317,7 @@ async def analyze(entry: LogEntry):
         "is_mobile": entry.is_mobile,
         "platform": entry.platform,
         "blocked": final_score >= 90,
-        "llm_recommendation": llm_recommendation[:1000],  # Tronqué pour Elasticsearch
+        "llm_recommendation": llm_recommendation[:1000],
         "llm_provider": llm_provider
     }
 
@@ -336,9 +334,6 @@ async def analyze(entry: LogEntry):
     return {
         "ip": entry.ip,
         "score": final_score,
-        "rule_score": score,
-        "ai_score": ai_score,
-        "ai_level": ai_level,
         "risk_level": risk_level,
         "action": action,
         "attack_type": attack_type,
@@ -371,35 +366,40 @@ async def top_threats(limit: int = 10):
 
 @app.get("/api/v1/test-llm")
 async def test_llm():
-    """Test endpoint pour comparer les deux LLM avec recommandations détaillées"""
+    """Test endpoint pour comparer DeepSeek et Groq"""
     test_ip = "93.110.220.181"
-    results = {"status": "testing", "featherless": None, "groq": None, "note": "Detailed recommendations (max 500 chars)"}
+    results = {"status": "testing", "deepseek": None, "groq": None}
     
-    prompt = "What security actions for IP {test_ip} with score 94 (bruteforce)? Provide detailed recommendation in 3 sentences."
+    prompt = "IP 93.110.220.181 risk score 94/100 bruteforce attack. Give immediate action in 15 words."
     
-    if featherless_client:
+    # Test DeepSeek
+    if DEEPSEEK_API_KEY:
         try:
-            response = featherless_client.chat.completions.create(
-                model=FEATHERLESS_MODEL,
-                messages=[{"role": "user", "content": prompt}],
-                max_tokens=200,
-                temperature=0.3
-            )
-            results["featherless"] = response.choices[0].message.content.strip()
+            headers = {"Authorization": f"Bearer {DEEPSEEK_API_KEY}", "Content-Type": "application/json"}
+            payload = {
+                "model": DEEPSEEK_MODEL,
+                "messages": [{"role": "user", "content": prompt}],
+                "max_tokens": 50,
+                "temperature": 0.3
+            }
+            response = requests.post(DEEPSEEK_API_URL, headers=headers, json=payload, timeout=10)
+            if response.status_code == 200:
+                results["deepseek"] = response.json()['choices'][0]['message']['content'].strip()
         except Exception as e:
-            results["featherless"] = f"Error: {str(e)[:80]}"
+            results["deepseek"] = f"Error: {str(e)[:50]}"
     
+    # Test Groq
     if groq_client:
         try:
             response = groq_client.chat.completions.create(
-                model=GROQ_MODEL,
+                model="llama-3.3-70b-versatile",
                 messages=[{"role": "user", "content": prompt}],
-                max_tokens=200,
+                max_tokens=50,
                 temperature=0.3
             )
             results["groq"] = response.choices[0].message.content.strip()
         except Exception as e:
-            results["groq"] = f"Error: {str(e)[:80]}"
+            results["groq"] = f"Error: {str(e)[:50]}"
     
     return results
 
