@@ -1,0 +1,10 @@
+fastapi
+uvicorn
+redis
+elasticsearch
+pandas
+scikit-learn
+python-dotenv
+faker
+pytest
+httpx

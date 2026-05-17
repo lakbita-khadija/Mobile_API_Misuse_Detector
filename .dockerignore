@@ -1,0 +1,7 @@
+.git
+data
+models
+notebooks
+venv
+__pycache__
+*.pyc
