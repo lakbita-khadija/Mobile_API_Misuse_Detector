@@ -56,38 +56,31 @@ def health():
 async def analyze(entry: LogEntry):
     score = 20
 
-    # Bruteforce detection
     if entry.status in [401, 403]:
         score += 40
 
-    # Failed attempts
     if entry.failed_attempts >= 3:
         score += 20
 
-    # Suspicious user-agent
     if "python-requests" in entry.user_agent.lower():
         score += 30
 
-    # Enumeration detection
     suspicious_endpoints = ["/admin", "/config", "/debug", "/env", "/.env"]
     if any(e in entry.endpoint for e in suspicious_endpoints):
         score += 20
 
-    # SQL injection detection
     sql_patterns = ["UNION", "SELECT", "DROP", "INSERT", "passwd", "etc/passwd"]
     if any(p.lower() in entry.endpoint.lower() for p in sql_patterns):
         score += 30
 
     score = min(score, 100)
 
-    # Intégrer le score IA
     ai_score = ai_scores.get(entry.ip, 0)
     ai_level = ai_levels.get(entry.ip, "unknown")
     iso_score = ai_iso.get(entry.ip, 0)
     dbscan_score = ai_dbscan.get(entry.ip, 0)
     ae_score = ai_ae.get(entry.ip, 0)
 
-    # Score final combiné : 60% règles + 40% IA
     if ai_score > 0:
         final_score = int((score * 0.6) + (ai_score * 100 * 0.4))
         final_score = min(final_score, 100)
@@ -97,7 +90,6 @@ async def analyze(entry: LogEntry):
     action = get_action(final_score)
     risk_level = get_risk_level(final_score)
 
-    # Rate limiting si score >= 60
     if final_score >= 60:
         limit = 20 if final_score < 90 else 5
         allowed, remaining = token_bucket_check(entry.ip, limit, 60, r)
@@ -105,10 +97,8 @@ async def analyze(entry: LogEntry):
             action = "blocked"
             r.setex(f"block:{entry.ip}", 900, 1)
 
-    # Sauvegarder le score dans Redis
     r.set(f"score:{entry.ip}", final_score)
 
-    # Déterminer attack_type
     if entry.failed_attempts >= 3 or (entry.status == 401 and "python-requests" in entry.user_agent.lower()):
         attack_type = "bruteforce"
     elif any(e in entry.endpoint for e in suspicious_endpoints):
@@ -120,32 +110,78 @@ async def analyze(entry: LogEntry):
     else:
         attack_type = "none"
 
-    # Alerte Redis + Slack si score critique
     if final_score >= 90:
         r.lpush("alerts", f"{entry.ip}|{final_score}|{entry.endpoint}")
 
-        # Alerte Slack
         if SLACK_WEBHOOK:
             slack_msg = {
-                "text": f"🚨 *ATTAQUE DÉTECTÉE*\n"
-                        f"• IP: `{entry.ip}`\n"
-                        f"• Score: `{final_score}/100`\n"
-                        f"• Rule Score: `{score}`\n"
-                        f"• AI Score: `{ai_score}` ({ai_level})\n"
-                        f"• Type: `{attack_type}`\n"
-                        f"• Endpoint: `{entry.endpoint}`\n"
-                        f"• Pays: `{entry.country}`\n"
-                        f"• Device: `{entry.device_model}`\n"
-                        f"• Action: `block_and_alert` 🔒"
+                "blocks": [
+                    {
+                        "type": "header",
+                        "text": {
+                            "type": "plain_text",
+                            "text": "SECURITY ALERT — Mobile API Misuse Detector"
+                        }
+                    },
+                    {
+                        "type": "divider"
+                    },
+                    {
+                        "type": "section",
+                        "fields": [
+                            {"type": "mrkdwn", "text": f"*IP Address:*\n`{entry.ip}`"},
+                            {"type": "mrkdwn", "text": f"*Country:*\n`{entry.country}`"}
+                        ]
+                    },
+                    {
+                        "type": "section",
+                        "fields": [
+                            {"type": "mrkdwn", "text": f"*Risk Score:*\n`{final_score}/100` — {risk_level.upper()}"},
+                            {"type": "mrkdwn", "text": f"*Attack Type:*\n`{attack_type}`"}
+                        ]
+                    },
+                    {
+                        "type": "section",
+                        "fields": [
+                            {"type": "mrkdwn", "text": f"*Endpoint:*\n`{entry.endpoint}`"},
+                            {"type": "mrkdwn", "text": f"*Method:*\n`{entry.method}`"}
+                        ]
+                    },
+                    {
+                        "type": "section",
+                        "fields": [
+                            {"type": "mrkdwn", "text": f"*Device:*\n`{entry.device_model}`"},
+                            {"type": "mrkdwn", "text": f"*User Agent:*\n`{entry.user_agent[:40]}`"}
+                        ]
+                    },
+                    {
+                        "type": "divider"
+                    },
+                    {
+                        "type": "section",
+                        "text": {
+                            "type": "mrkdwn",
+                            "text": f"*Action:* `block_and_alert` — IP blocked for 15 minutes"
+                        }
+                    },
+                    {
+                        "type": "context",
+                        "elements": [
+                            {
+                                "type": "mrkdwn",
+                                "text": f"Detected at {datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S')} UTC | Mobile API Misuse Detector"
+                            }
+                        ]
+                    }
+                ]
             }
             try:
                 async with httpx.AsyncClient() as client:
                     await client.post(SLACK_WEBHOOK, json=slack_msg, timeout=3)
-                    print(f"[SLACK] Alerte envoyée pour {entry.ip}")
+                    print(f"[SLACK] Alert sent for {entry.ip}")
             except Exception as e:
                 print(f"[SLACK WARNING] {e}")
 
-    # Indexer dans Elasticsearch
     log_doc = {
         "timestamp": datetime.utcnow().isoformat() + "Z",
         "ip": entry.ip,
