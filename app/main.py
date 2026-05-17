@@ -19,6 +19,10 @@ class LogEntry(BaseModel):
     user_agent: str
     is_mobile: bool = True
     platform: str = "unknown"
+    country: str = "unknown"
+    device_model: str = "unknown"
+    device_type: str = "unknown"
+    failed_attempts: int = 0
 
 @app.get("/")
 def root():
@@ -36,6 +40,10 @@ async def analyze(entry: LogEntry):
     if entry.status in [401, 403]:
         score += 40
 
+    # Failed attempts
+    if entry.failed_attempts >= 3:
+        score += 20
+
     # Suspicious user-agent
     if "python-requests" in entry.user_agent.lower():
         score += 30
@@ -44,6 +52,11 @@ async def analyze(entry: LogEntry):
     suspicious_endpoints = ["/admin", "/config", "/debug", "/env", "/.env"]
     if any(e in entry.endpoint for e in suspicious_endpoints):
         score += 20
+
+    # SQL injection detection
+    sql_patterns = ["UNION", "SELECT", "DROP", "INSERT", "passwd", "etc/passwd"]
+    if any(p.lower() in entry.endpoint.lower() for p in sql_patterns):
+        score += 30
 
     score = min(score, 100)
 
@@ -65,16 +78,39 @@ async def analyze(entry: LogEntry):
     if score >= 90:
         r.lpush("alerts", f"{entry.ip}|{score}|{entry.endpoint}")
 
-    # Indexer automatiquement dans Elasticsearch
+    # Déterminer attack_type
+    if entry.failed_attempts >= 3 or (entry.status == 401 and "python-requests" in entry.user_agent.lower()):
+        attack_type = "bruteforce"
+    elif any(e in entry.endpoint for e in suspicious_endpoints):
+        attack_type = "enumeration"
+    elif any(p.lower() in entry.endpoint.lower() for p in sql_patterns):
+        attack_type = "sql_injection"
+    elif entry.status in [401, 403]:
+        attack_type = "bruteforce"
+    else:
+        attack_type = "none"
+
+    # Indexer dans Elasticsearch avec tous les champs
     log_doc = {
         "timestamp": datetime.utcnow().isoformat() + "Z",
         "ip": entry.ip,
         "endpoint": entry.endpoint,
+        "method": entry.method,
         "status": entry.status,
+        "latency_ms": entry.latency_ms,
+        "user_agent": entry.user_agent,
         "risk_score": score,
         "risk_level": risk_level,
-        "attack_type": "bruteforce" if entry.status == 401 else "enumeration" if score >= 90 else "none"
+        "attack_type": attack_type,
+        "country": entry.country,
+        "device_model": entry.device_model,
+        "device_type": entry.device_type,
+        "failed_attempts": entry.failed_attempts,
+        "is_mobile": entry.is_mobile,
+        "platform": entry.platform,
+        "blocked": score >= 90
     }
+
     try:
         async with httpx.AsyncClient() as client:
             await client.post(
@@ -89,7 +125,8 @@ async def analyze(entry: LogEntry):
         "ip": entry.ip,
         "score": score,
         "risk_level": risk_level,
-        "action": action
+        "action": action,
+        "attack_type": attack_type
     }
 
 @app.get("/api/v1/status/{ip}")
