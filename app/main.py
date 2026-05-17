@@ -113,7 +113,11 @@ async def analyze(entry: LogEntry):
     if final_score >= 90:
         r.lpush("alerts", f"{entry.ip}|{final_score}|{entry.endpoint}")
 
-        if SLACK_WEBHOOK:
+        # Cooldown 15 min — une seule alerte par IP
+        alert_key = f"alerted:{entry.ip}"
+        if not r.exists(alert_key) and SLACK_WEBHOOK:
+            r.setex(alert_key, 900, 1)
+
             slack_msg = {
                 "blocks": [
                     {
@@ -221,9 +225,6 @@ async def analyze(entry: LogEntry):
     return {
         "ip": entry.ip,
         "score": final_score,
-        "rule_score": score,
-        "ai_score": ai_score,
-        "ai_level": ai_level,
         "risk_level": risk_level,
         "action": action,
         "attack_type": attack_type
@@ -263,5 +264,5 @@ def get_action(score: int) -> str:
     if score < 40: return "log_only"
     if score < 60: return "rate_limit_soft"
     if score < 75: return "rate_limit_strict"
-    if score < 90: return "captcha_required"
+    if score < 90: return "rate_limit_strict"
     return "block_and_alert"
