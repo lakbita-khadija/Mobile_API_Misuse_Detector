@@ -1,7 +1,9 @@
 from fastapi import FastAPI
 from pydantic import BaseModel
 import redis
+import numpy as np
 import httpx
+import joblib
 import os
 import pandas as pd
 from datetime import datetime
@@ -11,7 +13,15 @@ from groq import Groq
 ES_URL = "http://elasticsearch:9200"
 SLACK_WEBHOOK = os.getenv("SLACK_WEBHOOK", "")
 GROQ_API_KEY = os.getenv("GROQ_API_KEY", "")
-
+try:
+    iso_model = joblib.load("/app/models/isolation_forest.pkl")
+    iso_scaler = joblib.load("/app/models/scaler.pkl")
+    dbscan_scaler = joblib.load("/app/models/dbscan_scaler.pkl")
+    print("[MODELS] Isolation Forest + DBSCAN loaded")
+except Exception as e:
+    print(f"[MODELS WARNING] {e}")
+    iso_model = None
+    iso_scaler = None
 app = FastAPI(title="Mobile API Misuse Detector", version="3.0.0")
 r = redis.Redis(host='redis', port=6379, decode_responses=True)
 
@@ -218,7 +228,80 @@ async def test_llm():
         except Exception as e:
             return {"status": "error", "groq": str(e)}
     return {"status": "error", "groq": "GROQ_API_KEY not configured"}
+def compute_realtime_ai_score(ip: str, entry: LogEntry) -> tuple:
+    """Calcule le score IA en temps réel via Redis + modèles pkl"""
+    
+    key = f"features:{ip}"
+    pipe = r.pipeline()
+    
+    # Incrémenter les compteurs
+    pipe.hincrby(key, "request_count", 1)
+    pipe.hincrby(key, "login_attempt_count", 1 if entry.endpoint == "/login" else 0)
+    pipe.hincrby(key, "failed_login_count", 1 if entry.status == 401 else 0)
+    pipe.hincrby(key, "status_404_count", 1 if entry.status == 404 else 0)
+    pipe.hincrby(key, "bot_count", 1 if "python-requests" in entry.user_agent.lower() else 0)
+    pipe.hincrby(key, "post_count", 1 if entry.method == "POST" else 0)
+    pipe.hincrby(key, "mobile_count", 1 if entry.is_mobile else 0)
+    pipe.expire(key, 300)  # 5 minutes window
+    pipe.execute()
 
+    data = r.hgetall(key)
+    req_count = max(int(data.get("request_count", 1)), 1)
+    failed    = int(data.get("failed_login_count", 0))
+    bot       = int(data.get("bot_count", 0))
+    post      = int(data.get("post_count", 0))
+    mobile    = int(data.get("mobile_count", 0))
+    login     = int(data.get("login_attempt_count", 0))
+    s404      = int(data.get("status_404_count", 0))
+
+    features = np.array([[
+        req_count,                                      # request_count
+        req_count,                                      # max_req_count_5min
+        req_count,                                      # avg_req_count_5min
+        req_count / 300.0,                              # requests_per_second
+        300.0 / req_count,                              # avg_time_between_requests
+        1,                                              # unique_endpoints
+        1,                                              # unique_ids_accessed
+        s404,                                           # status_404_count
+        failed / req_count,                             # max_error_rate_5min
+        bot / req_count,                                # suspicious_ua_ratio
+        bot / req_count,                                # bot_ratio
+        mobile / req_count,                             # mobile_ratio
+        post / req_count,                               # post_frequency
+        req_count,                                      # max_repeated_endpoint_hits
+        login,                                          # login_attempt_count
+        failed,                                         # failed_login_count
+        failed / max(login, 1),                         # failed_login_rate
+        login,                                          # max_login_req_per_min
+        300.0 / max(login, 1)                           # avg_time_between_login_attempts
+    ]])
+
+    if iso_model is None or iso_scaler is None:
+        return 0.0, "unknown"
+
+    try:
+        features_scaled = iso_scaler.transform(features)
+        prediction = iso_model.predict(features_scaled)  # -1=anomalie, 1=normal
+        score_raw = iso_model.decision_function(features_scaled)[0]
+        
+        # Convertir en score 0-1
+        # decision_function : négatif = anomalie, positif = normal
+        ai_score = max(0.0, min(1.0, -score_raw + 0.5))
+        
+        if ai_score >= 0.7:
+            ai_level = "Critical"
+        elif ai_score >= 0.5:
+            ai_level = "High"
+        elif ai_score >= 0.3:
+            ai_level = "Medium"
+        else:
+            ai_level = "Low"
+            
+        return round(ai_score, 3), ai_level
+        
+    except Exception as e:
+        print(f"[AI ERROR] {e}")
+        return 0.0, "unknown"
 @app.post("/api/v1/analyze")
 async def analyze(entry: LogEntry):
 
@@ -251,8 +334,20 @@ async def analyze(entry: LogEntry):
     # =========================
     # SCORES IA
     # =========================
-    ai_score     = ai_scores.get(clean_ip, 0)
-    ai_level     = ai_levels.get(clean_ip, "unknown")
+    # Nouveau — score IA en temps réel
+ai_score_realtime, ai_level_realtime = compute_realtime_ai_score(clean_ip, entry)
+
+# Combiner lookup CSV + temps réel
+ai_score_csv = ai_scores.get(clean_ip, 0)
+ai_level_csv = ai_levels.get(clean_ip, "unknown")
+
+# Prendre le max des deux
+if ai_score_csv > 0:
+    ai_score = max(ai_score_csv, ai_score_realtime)
+    ai_level = ai_level_csv if ai_score_csv >= ai_score_realtime else ai_level_realtime
+else:
+    ai_score = ai_score_realtime
+    ai_level = ai_level_realtime
     iso_score    = ai_iso.get(clean_ip, 0)
     dbscan_score = ai_dbscan.get(clean_ip, 0)
     ae_score     = ai_ae.get(clean_ip, 0)
