@@ -1,11 +1,9 @@
 from fastapi import FastAPI
 from pydantic import BaseModel
 import redis
-
 from app.response.ratelimit import token_bucket_check
 
 app = FastAPI(title="Mobile API Misuse Detector")
-
 r = redis.Redis(host='redis', port=6379, decode_responses=True)
 
 class LogEntry(BaseModel):
@@ -15,49 +13,95 @@ class LogEntry(BaseModel):
     status: int
     latency_ms: int
     user_agent: str
-
+    is_mobile: bool = True
+    platform: str = "unknown"
 
 @app.get("/")
 def root():
     return {"message": "API running"}
 
+@app.get("/health")
+def health():
+    return {"status": "ok"}
 
 @app.post("/api/v1/analyze")
 async def analyze(entry: LogEntry):
-
     score = 20
 
-    # simple bruteforce detection
+    # Bruteforce detection
     if entry.status in [401, 403]:
         score += 40
 
-    # simple suspicious user-agent
+    # Suspicious user-agent
     if "python-requests" in entry.user_agent.lower():
         score += 30
 
-    action = "allow"
+    # Enumeration detection
+    suspicious_endpoints = ["/admin", "/config", "/debug", "/env", "/.env"]
+    if any(e in entry.endpoint for e in suspicious_endpoints):
+        score += 20
 
+    score = min(score, 100)
+
+    # Action selon score
+    action = get_action(score)
+    risk_level = get_risk_level(score)
+
+    # Rate limiting si score >= 60
     if score >= 60:
-        allowed, remaining = token_bucket_check(
-            entry.ip,
-            20,
-            60,
-            r
-        )
-
+        limit = 20 if score < 90 else 5
+        allowed, remaining = token_bucket_check(entry.ip, limit, 60, r)
         if not allowed:
             action = "blocked"
+            r.setex(f"block:{entry.ip}", 900, 1)
+
+    # Sauvegarder le score dans Redis
+    r.set(f"score:{entry.ip}", score)
+
+    # Alerte si score critique
+    if score >= 90:
+        r.lpush("alerts", f"{entry.ip}|{score}|{entry.endpoint}")
 
     return {
         "ip": entry.ip,
         "score": score,
+        "risk_level": risk_level,
         "action": action
     }
-
 
 @app.get("/api/v1/status/{ip}")
 async def status(ip: str):
     return {
         "ip": ip,
-        "blocked": bool(r.exists(f"block:{ip}"))
+        "blocked": bool(r.exists(f"block:{ip}")),
+        "block_ttl": r.ttl(f"block:{ip}"),
+        "score": int(r.get(f"score:{ip}") or 0)
     }
+
+@app.delete("/api/v1/block/{ip}")
+async def unblock(ip: str):
+    r.delete(f"block:{ip}")
+    return {"status": "unblocked", "ip": ip}
+
+@app.get("/api/v1/top-threats")
+async def top_threats(limit: int = 10):
+    keys = r.keys("score:*")
+    threats = [
+        {"ip": k.split(":")[1], "score": int(r.get(k) or 0)}
+        for k in keys
+    ]
+    return sorted(threats, key=lambda x: x["score"], reverse=True)[:limit]
+
+def get_risk_level(score: int) -> str:
+    if score < 40: return "normal"
+    if score < 60: return "suspect"
+    if score < 75: return "high"
+    if score < 90: return "critical"
+    return "attack"
+
+def get_action(score: int) -> str:
+    if score < 40: return "log_only"
+    if score < 60: return "rate_limit_soft"
+    if score < 75: return "rate_limit_strict"
+    if score < 90: return "captcha_required"
+    return "block_and_alert"
