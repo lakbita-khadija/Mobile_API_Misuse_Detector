@@ -1,7 +1,11 @@
 from fastapi import FastAPI
 from pydantic import BaseModel
 import redis
+import httpx
+from datetime import datetime
 from app.response.ratelimit import token_bucket_check
+
+ES_URL = "http://elasticsearch:9200"
 
 app = FastAPI(title="Mobile API Misuse Detector")
 r = redis.Redis(host='redis', port=6379, decode_responses=True)
@@ -43,7 +47,6 @@ async def analyze(entry: LogEntry):
 
     score = min(score, 100)
 
-    # Action selon score
     action = get_action(score)
     risk_level = get_risk_level(score)
 
@@ -61,6 +64,26 @@ async def analyze(entry: LogEntry):
     # Alerte si score critique
     if score >= 90:
         r.lpush("alerts", f"{entry.ip}|{score}|{entry.endpoint}")
+
+    # Indexer automatiquement dans Elasticsearch
+    log_doc = {
+        "timestamp": datetime.utcnow().isoformat() + "Z",
+        "ip": entry.ip,
+        "endpoint": entry.endpoint,
+        "status": entry.status,
+        "risk_score": score,
+        "risk_level": risk_level,
+        "attack_type": "bruteforce" if entry.status == 401 else "enumeration" if score >= 90 else "none"
+    }
+    try:
+        async with httpx.AsyncClient() as client:
+            await client.post(
+                f"{ES_URL}/mobile-api-logs-{datetime.utcnow().strftime('%Y.%m.%d')}/_doc",
+                json=log_doc,
+                timeout=3
+            )
+    except Exception as e:
+        print(f"[ES WARNING] Could not index: {e}")
 
     return {
         "ip": entry.ip,
