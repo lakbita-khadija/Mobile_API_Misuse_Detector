@@ -71,7 +71,7 @@ class LogEntry(BaseModel):
 # FONCTION LLM
 # =========================
 
-async def get_llm_recommendation(ip: str, score: int, risk_level: str, attack_type: str) -> tuple:
+async def get_llm_recommendation(ip: str, score: int, risk_level: str, attack_type: str, endpoint: str) -> tuple:
     """Génère une recommandation de sécurité détaillée avec Groq"""
     
     prompt = f"""You are a senior cybersecurity expert analyzing a REAL ATTACK detected by our AI system.
@@ -80,6 +80,7 @@ SECURITY EVENT (CONFIRMED ATTACK - NOT SAFE):
 - IP Address: {ip}
 - Risk Score: {score}/100 ({risk_level.upper()})
 - Attack Type: {attack_type.upper()}
+- Endpoint: {endpoint}
 - This is a MALICIOUS attack, not normal traffic.
 
 Provide a professional security recommendation with these EXACT sections:
@@ -101,7 +102,7 @@ Be specific, actionable, and professional. NEVER say "safe" for attack data. Wri
                     {"role": "user", "content": prompt}
                 ],
                 temperature=0.3,
-                max_tokens=500
+                max_tokens=600
             )
             recommendation = response.choices[0].message.content.strip()
             print(f"[LLM] Groq generated recommendation for {ip} ({len(recommendation)} chars)")
@@ -112,66 +113,40 @@ Be specific, actionable, and professional. NEVER say "safe" for attack data. Wri
     return "BLOCK THIS IP IMMEDIATELY - Attack detected. Review authentication logs and implement rate limiting.", "Fallback (No LLM)"
 
 # =========================
-# FONCTION INDEXATION ALERTES
+# FONCTION POUR CONSTRUIRE LE MESSAGE SLACK
 # =========================
 
-async def index_abuse_alert(
-    ip: str,
-    score: int,
-    risk_level: str,
-    attack_type: str,
-    endpoint: str,
-    method: str,
-    country: str,
-    rule_score: int,
-    ai_score: float,
-    iso_score: int,
-    dbscan_score: int,
-    ae_score: int,
-    llm_recommendation: str,
-    llm_provider: str,
-    action: str
-) -> str:
-    """Indexe une alerte d'abus dans Elasticsearch"""
+def build_slack_alert(entry: LogEntry, final_score: int, risk_level: str, attack_type: str,
+                      rule_score: int, ai_score: float, ai_level: str, llm_recommendation: str,
+                      llm_provider: str) -> dict:
+    """Construit le message Slack exactement comme demandé"""
     
-    alert_doc = {
-        "timestamp": datetime.utcnow().isoformat() + "Z",
-        "alert_id": f"alert_{datetime.utcnow().strftime('%Y%m%d_%H%M%S')}_{ip.replace('.', '_')}",
-        "ip": ip,
-        "country": country,
-        "attack_type": attack_type,
-        "endpoint": endpoint,
-        "method": method,
-        "risk_score": score,
-        "risk_level": risk_level,
-        "rule_score": rule_score,
-        "ai_score": ai_score,
-        "iso_forest_score": iso_score,
-        "dbscan_score": dbscan_score,
-        "autoencoder_score": ae_score,
-        "llm_recommendation": llm_recommendation[:2000] if llm_recommendation else "",
-        "llm_provider": llm_provider,
-        "action_taken": action,
-        "blocked": True,
-        "block_duration_seconds": 900,
-        "status": "active",
-        "severity": "CRITICAL" if score >= 90 else "HIGH" if score >= 75 else "MEDIUM",
-        "source": "Mobile API Misuse Detector v3.0"
-    }
-    
-    try:
-        async with httpx.AsyncClient() as client:
-            response = await client.post(
-                f"{ES_URL}/abuse-alerts/_doc",
-                json=alert_doc,
-                timeout=5
-            )
-            alert_id = response.json().get('_id')
-            print(f"[ES] Abuse alert indexed for {ip} with ID: {alert_id}")
-            return alert_id
-    except Exception as e:
-        print(f"[ES ALERT WARNING] Could not index abuse alert: {e}")
-        return None
+    # Construction du message texte simple (pas de blocks complexes)
+    message = f"""SECURITY ALERT — Mobile API Misuse Detector
+
+IP Address: {entry.ip}
+Country: {entry.country if entry.country else 'unknown'}
+Risk Score: {final_score}/100 — {risk_level.upper()}
+Attack Type: {attack_type}
+Endpoint: {entry.endpoint}
+Method: {entry.method}
+Device: {entry.device_model if entry.device_model else 'unknown'}
+User Agent: {entry.user_agent[:50]}
+
+Action: block_and_alert — IP blocked for 15 minutes
+
+LLM Recommendation ({llm_provider})"""
+
+    if llm_recommendation:
+        message += f"""
+{llm_recommendation}"""
+
+    message += f"""
+
+Detected at {datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S')} UTC | Groq LLM Engine"""
+
+    # Retourner au format Slack (texte simple)
+    return {"text": message}
 
 # =========================
 # ROUTES
@@ -210,25 +185,6 @@ async def test_llm():
         except Exception as e:
             return {"status": "error", "groq": str(e)}
     return {"status": "error", "groq": "GROQ_API_KEY not configured"}
-
-@app.get("/api/v1/alerts")
-async def get_alerts(limit: int = 50, status_filter: str = "active"):
-    """Récupère les alertes d'abus depuis Elasticsearch"""
-    query = {
-        "size": limit,
-        "query": {"term": {"status": status_filter}} if status_filter != "all" else {"match_all": {}},
-        "sort": [{"timestamp": "desc"}]
-    }
-    try:
-        async with httpx.AsyncClient() as client:
-            response = await client.post(
-                f"{ES_URL}/abuse-alerts/_search",
-                json=query,
-                timeout=5
-            )
-            return response.json()
-    except Exception as e:
-        return {"error": str(e), "alerts": []}
 
 @app.post("/api/v1/analyze")
 async def analyze(entry: LogEntry):
@@ -286,8 +242,7 @@ async def analyze(entry: LogEntry):
             "risk_level": risk_level,
             "action": "blocked",
             "attack_type": "none",
-            "message": "IP is currently blocked. Please wait 15 minutes.",
-            "block_ttl": r.ttl(f"block:{entry.ip}")
+            "message": "IP is currently blocked. Please wait 15 minutes."
         }
 
     # =========================
@@ -324,13 +279,12 @@ async def analyze(entry: LogEntry):
     llm_provider = ""
     if final_score >= 75:
         llm_recommendation, llm_provider = await get_llm_recommendation(
-            entry.ip, final_score, risk_level, attack_type
+            entry.ip, final_score, risk_level, attack_type, entry.endpoint
         )
 
     # =========================
-    # BLOCAGE REDIS + ALERTE SLACK + INDEXATION
+    # BLOCAGE REDIS + ALERTE SLACK
     # =========================
-    alert_id = None
 
     if final_score >= 90:
         r.setex(f"block:{entry.ip}", 900, 1)
@@ -338,115 +292,31 @@ async def analyze(entry: LogEntry):
         
         r.lpush("alerts", f"{entry.ip}|{final_score}|{entry.endpoint}")
 
-        # Indexer l'alerte dans Elasticsearch
-        alert_id = await index_abuse_alert(
-            entry.ip, final_score, risk_level, attack_type,
-            entry.endpoint, entry.method, entry.country,
-            rule_score, ai_score, iso_score, dbscan_score, ae_score,
-            llm_recommendation, llm_provider, action
-        )
-
         # Alerte Slack
         alert_key = f"alerted:{entry.ip}"
         if not r.exists(alert_key) and SLACK_WEBHOOK:
             r.setex(alert_key, 900, 1)
 
-            slack_msg = {
-                "blocks": [
-                    {
-                        "type": "header",
-                        "text": {
-                            "type": "plain_text",
-                            "text": f"{'🔴 CRITICAL' if final_score >= 90 else '🟠 HIGH'} — Mobile API Misuse Detector"
-                        }
-                    },
-                    {"type": "divider"},
-                    {
-                        "type": "section",
-                        "fields": [
-                            {"type": "mrkdwn", "text": f"*🌐 IP Address:*\n`{entry.ip}`"},
-                            {"type": "mrkdwn", "text": f"*📍 Country:*\n`{entry.country if entry.country else 'Unknown'}`"}
-                        ]
-                    },
-                    {
-                        "type": "section",
-                        "fields": [
-                            {"type": "mrkdwn", "text": f"*📊 Risk Score:*\n`{final_score}/100` — *{risk_level.upper()}*"},
-                            {"type": "mrkdwn", "text": f"*⚔️ Attack Type:*\n`{attack_type.upper()}`"}
-                        ]
-                    },
-                    {
-                        "type": "section",
-                        "fields": [
-                            {"type": "mrkdwn", "text": f"*🎯 Endpoint:*\n`{entry.endpoint}`"},
-                            {"type": "mrkdwn", "text": f"*🔧 Method:*\n`{entry.method}`"}
-                        ]
-                    },
-                    {
-                        "type": "section",
-                        "fields": [
-                            {"type": "mrkdwn", "text": f"*📱 Device:*\n`{entry.device_model if entry.device_model else 'Unknown'}`"},
-                            {"type": "mrkdwn", "text": f"*🖥️ User Agent:*\n`{entry.user_agent[:50]}`"}
-                        ]
-                    },
-                    {"type": "divider"},
-                    {
-                        "type": "section",
-                        "text": {"type": "mrkdwn", "text": "*🎯 DETECTION BREAKDOWN*"}
-                    },
-                    {
-                        "type": "section",
-                        "fields": [
-                            {"type": "mrkdwn", "text": f"*📋 Rule Score:*\n`{rule_score}/100`"},
-                            {"type": "mrkdwn", "text": f"*🤖 AI Score:*\n`{ai_score}` *({ai_level})*"}
-                        ]
-                    },
-                    {
-                        "type": "section",
-                        "fields": [
-                            {"type": "mrkdwn", "text": f"*🌲 Isolation Forest:*\n`{iso_score}`" + (" *(🚨 Anomaly)*" if iso_score == 1 else " *(✅ Normal)*")},
-                            {"type": "mrkdwn", "text": f"*📊 DBSCAN:*\n`{dbscan_score}`" + (" *(🚨 Outlier)*" if dbscan_score == 1 else " *(✅ Normal)*")}
-                        ]
-                    },
-                    {
-                        "type": "section",
-                        "fields": [
-                            {"type": "mrkdwn", "text": f"*🔄 Autoencoder:*\n`{ae_score}`" + (" *(🚨 High error)*" if ae_score == 1 else " *(✅ Normal)*")},
-                            {"type": "mrkdwn", "text": f"*⚡ Action:*\n`block_and_alert`"}
-                        ]
-                    },
-                    {"type": "divider"},
-                    {
-                        "type": "section",
-                        "text": {
-                            "type": "mrkdwn",
-                            "text": f"*🛡️ RESPONSE:* IP `{entry.ip}` has been **blocked for 15 minutes**."
-                        }
-                    }
-                ]
-            }
-            
-            # Ajouter la recommandation LLM si disponible
-            if llm_recommendation and "BLOCK" not in llm_recommendation:
-                slack_msg["blocks"].append({"type": "divider"})
-                slack_msg["blocks"].append({
-                    "type": "section",
-                    "text": {
-                        "type": "mrkdwn",
-                        "text": f"*🧠 LLM RECOMMENDATION ({llm_provider})*\n{llm_recommendation}"
-                    }
-                })
-            
-            # Ajouter le footer
-            slack_msg["blocks"].append({
-                "type": "context",
-                "elements": [
-                    {
-                        "type": "mrkdwn",
-                        "text": f"🆔 Alert ID: `{alert_id}` | ⏰ Detected at {datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S')} UTC | Powered by Groq Llama 3.3 70B"
-                    }
-                ]
-            })
+            # Construction du message Slack simple
+            slack_message = f"""SECURITY ALERT — Mobile API Misuse Detector
+
+IP Address: {entry.ip}
+Country: {entry.country if entry.country else 'unknown'}
+Risk Score: {final_score}/100 — {risk_level.upper()}
+Attack Type: {attack_type}
+Endpoint: {entry.endpoint}
+Method: {entry.method}
+Device: {entry.device_model if entry.device_model else 'unknown'}
+User Agent: {entry.user_agent[:50]}
+
+Action: block_and_alert — IP blocked for 15 minutes
+
+LLM Recommendation ({llm_provider})
+{llm_recommendation if llm_recommendation else 'No recommendation available'}
+
+Detected at {datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S')} UTC | Groq LLM Engine"""
+
+            slack_msg = {"text": slack_message}
             
             try:
                 async with httpx.AsyncClient() as client:
@@ -483,8 +353,7 @@ async def analyze(entry: LogEntry):
         "attack_type": attack_type,
         "action": action,
         "blocked": final_score >= 90,
-        "alert_id": alert_id,
-        "llm_recommendation": llm_recommendation[:1000] if llm_recommendation else "",
+        "llm_recommendation": llm_recommendation[:2000] if llm_recommendation else "",
         "llm_provider": llm_provider
     }
 
@@ -515,7 +384,6 @@ async def analyze(entry: LogEntry):
         "action": action,
         "attack_type": attack_type,
         "blocked": final_score >= 90,
-        "alert_id": alert_id,
         "llm_provider": llm_provider,
         "llm_recommendation": llm_recommendation if final_score >= 75 else None
     }
