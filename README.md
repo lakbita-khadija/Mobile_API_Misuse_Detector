@@ -2,9 +2,6 @@
 
 
 **Real-time mobile API misuse detection powered by AI, Rate Limiting, and SOC Monitoring**
-
-[📖 Documentation](#démarrage-rapide) · [🔌 API Docs](http://localhost:8000/docs) · [📊 Kibana](http://localhost:5601) · [📈 Grafana](http://localhost:3000)
-
 ---
 
 ## 📋 Table of Contents
