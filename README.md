@@ -77,8 +77,7 @@ An intelligent pipeline that:
 |------------|-----------------------------------------|
 | 0 – 40     | `log_only` — Passive monitoring         |
 | 40 – 60    | `rate_limit_soft` — 100 req/min         |
-| 60 – 75    | `rate_limit_strict` — 20 req/min        |
-| 75 – 90    | `captcha_required`                      |
+| 60 – 75    | `rate_limit_strict` — 20 req/min        |             |
 | 90 – 100   | `block_and_alert` — IP blocked 15 min   |
 
 ### SOC Monitoring
